@@ -1,0 +1,93 @@
+name: unraid-image
+
+# Builds this fork into a CLIProxyAPI image, then layers the OzoneH3 Unraid
+# wrapper (WebUI on 8318, WEBUI_PASSWORD, /data appdata) on top of it, and
+# publishes both to GHCR:
+#   ghcr.io/<owner>/cliproxyapi:latest         plain CLIProxyAPI from this fork
+#   ghcr.io/<owner>/cliproxyapi-unraid:latest  drop-in for ghcr.io/ozoneh3/cliproxyapi-unraid
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unraid-image
+  cancel-in-progress: true
+
+env:
+  # Pinned wrapper revision for reproducible builds; bump to pick up wrapper changes.
+  WRAPPER_REPOSITORY: OzoneH3/CLIProxyAPI_unraid
+  WRAPPER_REF: c854fa68dcc533e70cdcb558ea1fdd2c85fc41d5
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Refresh models catalog
+        run: bash .github/scripts/refresh-model-catalogs.sh
+      - name: Generate build metadata
+        run: |
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          echo "IMAGE=ghcr.io/${owner}/cliproxyapi" >> "$GITHUB_ENV"
+          echo "UNRAID_IMAGE=ghcr.io/${owner}/cliproxyapi-unraid" >> "$GITHUB_ENV"
+          echo "VERSION=main-$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "COMMIT=$(git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push CLIProxyAPI image
+        id: core
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            COMMIT=${{ env.COMMIT }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+      - name: Checkout Unraid wrapper
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.WRAPPER_REPOSITORY }}
+          ref: ${{ env.WRAPPER_REF }}
+          path: unraid-wrapper
+      - name: Build and push Unraid image
+        uses: docker/build-push-action@v6
+        with:
+          context: unraid-wrapper
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            UPSTREAM_IMAGE=${{ env.IMAGE }}@${{ steps.core.outputs.digest }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.title=CLIProxyAPI for Unraid (api-key-limits fork)
+          tags: |
+            ${{ env.UNRAID_IMAGE }}:latest
+            ${{ env.UNRAID_IMAGE }}:${{ env.VERSION }}
