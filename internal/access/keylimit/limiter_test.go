@@ -167,6 +167,7 @@ func TestStatePersistsWithoutRawKeys(t *testing.T) {
 	limits := config.APIKeyLimitsConfig{StateFile: statePath, Keys: []config.APIKeyLimit{{Key: "secret-key-value", TokenLimit: 100}}}
 	l, _ := newTestLimiter(t, limits, time.Now())
 	charge(l, "secret-key-value", 70)
+	l.Flush()
 
 	data, errRead := os.ReadFile(statePath)
 	if errRead != nil {
@@ -203,7 +204,7 @@ func TestReconfigureKeepsCounters(t *testing.T) {
 func TestSnapshotMasksKeys(t *testing.T) {
 	l, _ := newTestLimiter(t, config.APIKeyLimitsConfig{Keys: []config.APIKeyLimit{{Key: "sk-abcdefghijkl", Name: "alice"}}}, time.Now())
 	snapshot := l.Snapshot()
-	if len(snapshot) != 1 || snapshot[0].Key != "sk-a...ijkl" || snapshot[0].Name != "alice" {
+	if len(snapshot) != 1 || snapshot[0].Key != "sk-a...ijkl" || snapshot[0].Name != "alice" || snapshot[0].ID != hashKey("sk-abcdefghijkl")[:16] {
 		t.Fatalf("snapshot = %+v", snapshot)
 	}
 }

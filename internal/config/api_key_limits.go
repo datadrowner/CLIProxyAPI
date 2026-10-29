@@ -27,6 +27,11 @@ type APIKeySubscription struct {
 	// Period controls when the budget resets: "total" (never, default), "daily",
 	// "weekly", "monthly" (calendar periods in UTC), or a Go duration such as "5h".
 	Period string `yaml:"period,omitempty" json:"period,omitempty"`
+
+	// AccountShare is the percentage (0-100] of each connected subscription
+	// account's limit windows (e.g. Claude 5h/7d) a key may consume. It resets
+	// when the account's window resets. Values <= 0 disable it.
+	AccountShare float64 `yaml:"account-share,omitempty" json:"account-share,omitempty"`
 }
 
 // APIKeyLimit configures one client API key.
@@ -50,6 +55,9 @@ type APIKeyLimit struct {
 
 	// Period overrides the subscription period. See APIKeySubscription.Period.
 	Period string `yaml:"period,omitempty" json:"period,omitempty"`
+
+	// AccountShare overrides the subscription account share. See APIKeySubscription.AccountShare.
+	AccountShare float64 `yaml:"account-share,omitempty" json:"account-share,omitempty"`
 }
 
 // LimitedAPIKeys returns the trimmed, non-empty keys configured under api-key-limits.

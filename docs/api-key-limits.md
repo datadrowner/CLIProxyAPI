@@ -37,6 +37,21 @@ access:
         period: weekly            # starter budget, but weekly
 ```
 
+## Share of connected subscription accounts
+
+`account-share` (percent, on a key or a subscription plan; a key's value overrides its plan's) limits how much of each connected subscription account a key may use. It follows the account's own limit windows as reported by the provider: Claude's unified 5-hour and 7-day windows (`anthropic-ratelimit-unified-*` headers) and Codex's primary and secondary windows (`x-codex-*-used-percent`). It resets when that account window resets.
+
+```yaml
+keys:
+  - key: "sk-laptop"
+    account-share: 10     # at most 10% of each account window
+  - key: "sk-phone"
+    subscription: pro
+    account-share: 5      # overrides the plan's share
+```
+
+How a key's portion is estimated: the provider only reports the account's total utilization, so the proxy records the API-equivalent cost (tokens for unpriced models) every key sends through each account, in 5-minute buckets. A key's portion of a window is `window utilization × key cost / total cost through that account since the window started`. Usage of the account outside this proxy (for example claude.ai) is therefore split across the keys in proportion to their use, which errs on the side of limiting early. A key is rejected with HTTP `429` (`api_key_account_share_exceeded`, `Retry-After` until the account window resets) once its portion of any active window of any account it used reaches its share. Windows appear after an account has served a request.
+
 ## Periods
 
 - `total` (default): the budget never resets.
@@ -58,4 +73,19 @@ Counters are written to `state-file` (default `<auth-dir>/api-key-usage.json`) a
 ## Inspecting usage
 
 - Clients: `GET /v1/api-key/usage` with their own key returns their limit, used and remaining tokens, and reset time. It still works after the budget is exhausted.
-- Admins: `GET /v8/management/observability/usage/api-key-limits` lists every configured key (masked) with its status.
+- Admins: `GET /v8/management/observability/usage/api-key-limits` lists every configured key (masked, plus a stable `id`, the first 16 hex characters of the key's SHA-256) with its status.
+- The section can be edited live with `GET`/`PUT /v8/management/config/access/api-key-limits`; saves are validated and hot-reloaded.
+
+## Analytics and API cost
+
+Every usage record is also aggregated per month (UTC), client key, upstream credential (`auth_index`) and model into `<auth-dir>/usage-analytics.json` (key digests only, 13 months kept, flushed every 15 seconds). For Anthropic models the record is priced at Anthropic API list prices: uncached input, cache reads and cache writes (5-minute rate, since the TTL is not reported) and output, including the Claude Haiku 5.5 long-prompt tier and the 2× fast-mode rate. Other models are counted in tokens only.
+
+`GET /v8/management/observability/usage/analytics?month=YYYY-MM` returns the rows, key labels, and the price table with its source.
+
+## Unraid WebUI
+
+The `ghcr.io/<owner>/cliproxyapi-unraid` image built by `.github/workflows/unraid-image.yml` adds three things to the WebUI:
+
+- **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans.
+- **Overview**: each key's budget and this month's usage, plus each connected account's provider-reported subscription windows (Claude 5h/7d utilization, Codex used percent).
+- **Analytics**: per-key, per-model and per-account tokens and API-equivalent cost for any recorded month, with a projected month total for the current month.

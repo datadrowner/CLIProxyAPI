@@ -80,9 +80,10 @@ jobs:
       - name: Patch and test Unraid wrapper
         working-directory: unraid-wrapper
         run: |
-          # Lets Connect replace a stuck login and accepts a pasted callback URL
+          # Adds API key/plan management, usage overview and analytics pages, lets
+          # Connect replace a stuck login, and accepts a pasted callback URL
           # matched by OAuth state, for sign-ins finished on another computer.
-          git apply --verbose ../.github/unraid/wrapper-oauth-callback.patch
+          git apply --verbose ../.github/unraid/wrapper.patch
           go test -race ./...
       - name: Build and push Unraid image
         uses: docker/build-push-action@v6

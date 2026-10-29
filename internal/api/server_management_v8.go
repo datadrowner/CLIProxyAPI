@@ -2,10 +2,12 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/access/keylimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/usageanalytics"
 )
 
 // registerManagementV8Routes defines the v8 contract independently of v0.
@@ -43,6 +45,16 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/observability/usage/api-keys", s.mgmt.GetAPIKeyUsage)
 	v8.GET("/observability/usage/api-key-limits", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"keys": keylimit.Default().Snapshot()})
+	})
+	v8.GET("/observability/usage/analytics", func(c *gin.Context) {
+		month := c.Query("month")
+		if month != "" {
+			if _, errParse := time.Parse("2006-01", month); errParse != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "month must be YYYY-MM"})
+				return
+			}
+		}
+		c.JSON(http.StatusOK, usageanalytics.Default().Report(month))
 	})
 	v8.GET("/observability/usage/queue", s.mgmt.GetUsageQueue)
 

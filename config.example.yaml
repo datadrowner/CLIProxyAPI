@@ -151,6 +151,9 @@ access:
   #     - key: "pro-plus-key"              # "pro" period with a larger budget
   #       subscription: "pro"
   #       token-limit: 5000000
+  #     - key: "laptop-key"                # at most 10% of each connected subscription
+  #       account-share: 10                # account's limit windows (e.g. Claude 5h/7d);
+  #                                        # resets when the account's window resets
 
 # Optional credential concurrency and observation contracts.
 

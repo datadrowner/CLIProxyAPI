@@ -1,0 +1,1610 @@
+diff --git a/internal/cliproxy/client.go b/internal/cliproxy/client.go
+index b4bc63b..d2e46b0 100644
+--- a/internal/cliproxy/client.go
++++ b/internal/cliproxy/client.go
+@@ -22,6 +22,7 @@ import (
+ )
+ 
+ var ErrUnauthorized = errors.New("upstream authentication rejected")
++var ErrNotFound = errors.New("upstream resource not found")
+ 
+ type Client struct {
+ 	Reload               func(context.Context) error
+@@ -76,6 +77,9 @@ func (c *Client) request(ctx context.Context, method, path, key string, body, ou
+ 	if resp.StatusCode == 401 {
+ 		return "", ErrUnauthorized
+ 	}
++	if resp.StatusCode == 404 {
++		return "", ErrNotFound
++	}
+ 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+ 		return "", errors.New("upstream rejected request")
+ 	}
+@@ -110,8 +114,10 @@ type Account struct {
+ 	Plan     string `json:"plan,omitempty"`
+ 	Disabled bool   `json:"disabled"`
+ 	Status   string `json:"status"`
+-	Name     string `json:"-"`
+-	Index    string `json:"-"`
++	// Limits are subscription windows reported by the provider (e.g. Claude 5h/7d).
++	Limits []QuotaWindow `json:"limits"`
++	Name   string        `json:"-"`
++	Index  string        `json:"-"`
+ }
+ 
+ func accountID(name, index string) string {
+@@ -130,6 +136,10 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
+ 			IDToken                             struct {
+ 				Plan string `json:"plan_type"`
+ 			} `json:"id_token"`
++			Quota struct {
++				ObservedAt time.Time         `json:"observed_at"`
++				Signals    map[string]string `json:"signals"`
++			} `json:"quota"`
+ 		} `json:"files"`
+ 	}
+ 	if e := c.Do(ctx, "GET", "/v8/management/credentials", nil, &out); e != nil {
+@@ -158,7 +168,7 @@ func (c *Client) Accounts(ctx context.Context) ([]Account, error) {
+ 		if len(v.Email) <= 254 && strings.Contains(v.Email, "@") && !strings.ContainsAny(v.Email, "\r\n") {
+ 			email = v.Email
+ 		}
+-		a = append(a, Account{ID: accountID(v.Name, v.AuthIndex), Provider: p, Email: email, Plan: plan, Disabled: v.Disabled, Status: status, Name: v.Name, Index: v.AuthIndex})
++		a = append(a, Account{ID: accountID(v.Name, v.AuthIndex), Provider: p, Email: email, Plan: plan, Disabled: v.Disabled, Status: status, Limits: QuotaWindows(v.Quota.Signals, v.Quota.ObservedAt), Name: v.Name, Index: v.AuthIndex})
+ 	}
+ 	return a, nil
+ }
+diff --git a/internal/cliproxy/limits.go b/internal/cliproxy/limits.go
+new file mode 100644
+index 0000000..c10aa8b
+--- /dev/null
++++ b/internal/cliproxy/limits.go
+@@ -0,0 +1,202 @@
++package cliproxy
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"net/url"
++	"strings"
++	"time"
++)
++
++// Plan is a named token budget that limited keys can reference.
++type Plan struct {
++	Name       string `json:"name"`
++	TokenLimit int64  `json:"token-limit,omitempty"`
++	Period     string `json:"period,omitempty"`
++	// AccountShare is the percentage of each connected account's limit windows a key may use.
++	AccountShare float64 `json:"account-share,omitempty"`
++}
++
++// LimitedKey is a client API key under access.api-key-limits.
++type LimitedKey struct {
++	Key          string  `json:"key"`
++	Name         string  `json:"name,omitempty"`
++	Subscription string  `json:"subscription,omitempty"`
++	TokenLimit   int64   `json:"token-limit,omitempty"`
++	Period       string  `json:"period,omitempty"`
++	AccountShare float64 `json:"account-share,omitempty"`
++}
++
++// AccountShare is a key's estimated portion of one account limit window.
++type AccountShare struct {
++	AuthIndex          string    `json:"-"`
++	Account            string    `json:"account"`
++	Window             string    `json:"window"`
++	UsedPercent        float64   `json:"used_percent"`
++	SharePercent       float64   `json:"share_percent"`
++	AccountUsedPercent float64   `json:"account_used_percent"`
++	ResetsAt           time.Time `json:"resets_at"`
++}
++
++// UnmarshalJSON reads the upstream auth_index, which is not passed to the browser.
++func (s *AccountShare) UnmarshalJSON(data []byte) error {
++	type plain AccountShare
++	var raw struct {
++		plain
++		AuthIndex string `json:"auth_index"`
++	}
++	if e := json.Unmarshal(data, &raw); e != nil {
++		return e
++	}
++	*s = AccountShare(raw.plain)
++	s.AuthIndex = raw.AuthIndex
++	return nil
++}
++
++// Limits mirrors access.api-key-limits in the upstream configuration.
++type Limits struct {
++	StateFile     string       `json:"state-file,omitempty"`
++	Subscriptions []Plan       `json:"subscriptions"`
++	Keys          []LimitedKey `json:"keys"`
++}
++
++// KeyUsage is the current budget state of one limited key.
++type KeyUsage struct {
++	ID              string         `json:"id"`
++	Period          string         `json:"period"`
++	Unlimited       bool           `json:"unlimited"`
++	TokenLimit      int64          `json:"token_limit"`
++	UsedTokens      int64          `json:"used_tokens"`
++	RemainingTokens int64          `json:"remaining_tokens"`
++	Requests        int64          `json:"requests"`
++	ResetsAt        time.Time      `json:"resets_at"`
++	AccountShare    float64        `json:"account_share"`
++	AccountShares   []AccountShare `json:"account_shares"`
++}
++
++// UsageRow is one month of usage for a key, credential and model.
++type UsageRow struct {
++	KeyID            string  `json:"key_id"`
++	AuthIndex        string  `json:"auth_index"`
++	Provider         string  `json:"provider"`
++	Model            string  `json:"model"`
++	Requests         int64   `json:"requests"`
++	Failed           int64   `json:"failed"`
++	InputTokens      int64   `json:"input_tokens"`
++	CacheReadTokens  int64   `json:"cache_read_tokens"`
++	CacheWriteTokens int64   `json:"cache_write_tokens"`
++	OutputTokens     int64   `json:"output_tokens"`
++	ReasoningTokens  int64   `json:"reasoning_tokens"`
++	TotalTokens      int64   `json:"total_tokens"`
++	CostUSD          float64 `json:"cost_usd"`
++	UnpricedTokens   int64   `json:"unpriced_tokens"`
++}
++
++// Price is an Anthropic API list price in USD per million tokens.
++type Price struct {
++	Model        string  `json:"model"`
++	Name         string  `json:"name"`
++	Input        float64 `json:"input"`
++	CacheWrite5m float64 `json:"cache_write_5m"`
++	CacheWrite1h float64 `json:"cache_write_1h"`
++	CacheRead    float64 `json:"cache_read"`
++	Output       float64 `json:"output"`
++	Legacy       bool    `json:"legacy,omitempty"`
++	FastMode     bool    `json:"fast_mode,omitempty"`
++	LongPrompt   *struct {
++		Input  float64 `json:"input"`
++		Output float64 `json:"output"`
++	} `json:"long_prompt,omitempty"`
++	LongPromptThreshold int64 `json:"long_prompt_threshold,omitempty"`
++}
++
++// Analytics is one month of usage with key labels and the price table.
++type Analytics struct {
++	Month         string            `json:"month"`
++	Months        []string          `json:"months"`
++	Rows          []UsageRow        `json:"rows"`
++	Keys          map[string]string `json:"keys"`
++	Pricing       []Price           `json:"pricing"`
++	PricingSource string            `json:"pricing_source"`
++}
++
++// QuotaWindow is a provider-reported subscription limit window of an account.
++type QuotaWindow struct {
++	Label       string    `json:"label"`
++	UsedPercent float64   `json:"used_percent"`
++	ResetsAt    time.Time `json:"resets_at,omitempty"`
++}
++
++const limitsPath = "/v8/management/config/access/api-key-limits"
++
++// KeyID matches the upstream identifier for a client key (SHA-256 hex prefix).
++func KeyID(key string) string {
++	s := sha256.Sum256([]byte(strings.TrimSpace(key)))
++	return hex.EncodeToString(s[:])[:16]
++}
++
++// Limits reads access.api-key-limits; a missing section is empty.
++func (c *Client) Limits(ctx context.Context) (Limits, error) {
++	var out Limits
++	if e := c.Do(ctx, "GET", limitsPath, nil, &out); e != nil {
++		if errors.Is(e, ErrNotFound) {
++			return Limits{Subscriptions: []Plan{}, Keys: []LimitedKey{}}, nil
++		}
++		return Limits{}, e
++	}
++	if out.Subscriptions == nil {
++		out.Subscriptions = []Plan{}
++	}
++	if out.Keys == nil {
++		out.Keys = []LimitedKey{}
++	}
++	return out, nil
++}
++
++// SaveLimits replaces access.api-key-limits; upstream validates and hot-reloads it.
++func (c *Client) SaveLimits(ctx context.Context, l Limits) error {
++	if l.Subscriptions == nil {
++		l.Subscriptions = []Plan{}
++	}
++	if l.Keys == nil {
++		l.Keys = []LimitedKey{}
++	}
++	return c.Do(ctx, "PUT", limitsPath, l, nil)
++}
++
++// KeyUsage returns the budget state of limited keys by key ID.
++func (c *Client) KeyUsage(ctx context.Context) (map[string]KeyUsage, error) {
++	var out struct {
++		Keys []KeyUsage `json:"keys"`
++	}
++	if e := c.Do(ctx, "GET", "/v8/management/observability/usage/api-key-limits", nil, &out); e != nil {
++		return nil, e
++	}
++	usage := make(map[string]KeyUsage, len(out.Keys))
++	for _, k := range out.Keys {
++		usage[k.ID] = k
++	}
++	return usage, nil
++}
++
++// Analytics returns monthly usage; month is "YYYY-MM" or empty for the current month.
++func (c *Client) Analytics(ctx context.Context, month string) (Analytics, error) {
++	path := "/v8/management/observability/usage/analytics"
++	if month != "" {
++		path += "?" + url.Values{"month": {month}}.Encode()
++	}
++	var out Analytics
++	if e := c.Do(ctx, "GET", path, nil, &out); e != nil {
++		return Analytics{}, e
++	}
++	if out.Rows == nil {
++		out.Rows = []UsageRow{}
++	}
++	if out.Months == nil {
++		out.Months = []string{}
++	}
++	return out, nil
++}
+diff --git a/internal/cliproxy/quota.go b/internal/cliproxy/quota.go
+new file mode 100644
+index 0000000..5eef882
+--- /dev/null
++++ b/internal/cliproxy/quota.go
+@@ -0,0 +1,98 @@
++package cliproxy
++
++import (
++	"math"
++	"sort"
++	"strconv"
++	"strings"
++	"time"
++)
++
++// QuotaWindows converts provider rate-limit headers observed by upstream into
++// subscription usage windows. Only numeric fields are read; other header values
++// are ignored.
++//
++// Claude: anthropic-ratelimit-unified-<window>-utilization (0..1) and -reset (unix seconds).
++// Codex: x-codex-<limit>-used-percent (0..100), -window-minutes, -reset-at (unix
++// seconds) or -reset-after-seconds (relative to the observation time).
++func QuotaWindows(signals map[string]string, observedAt time.Time) []QuotaWindow {
++	lower := make(map[string]string, len(signals))
++	for k, v := range signals {
++		lower[strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
++	}
++	number := func(key string) (float64, bool) {
++		v, ok := lower[key]
++		if !ok {
++			return 0, false
++		}
++		f, e := strconv.ParseFloat(v, 64)
++		if e != nil || math.IsNaN(f) || math.IsInf(f, 0) {
++			return 0, false
++		}
++		return f, true
++	}
++	unix := func(key string) time.Time {
++		if f, ok := number(key); ok && f > 1e9 && f < 1e11 {
++			return time.Unix(int64(f), 0).UTC()
++		}
++		return time.Time{}
++	}
++	windows := []QuotaWindow{}
++	for key := range lower {
++		switch {
++		case strings.HasPrefix(key, "anthropic-ratelimit-unified-") && strings.HasSuffix(key, "-utilization"):
++			name := strings.TrimSuffix(strings.TrimPrefix(key, "anthropic-ratelimit-unified-"), "-utilization")
++			used, ok := number(key)
++			if !ok || name == "" {
++				continue
++			}
++			windows = append(windows, QuotaWindow{
++				Label:       windowLabel(name),
++				UsedPercent: clampPercent(used * 100),
++				ResetsAt:    unix("anthropic-ratelimit-unified-" + name + "-reset"),
++			})
++		case strings.HasPrefix(key, "x-codex-") && strings.HasSuffix(key, "-used-percent"):
++			base := strings.TrimSuffix(key, "-used-percent")
++			used, ok := number(key)
++			if !ok {
++				continue
++			}
++			label := strings.TrimPrefix(base, "x-codex-")
++			if minutes, okMinutes := number(base + "-window-minutes"); okMinutes && minutes > 0 {
++				label = minutesLabel(minutes) + " (" + label + ")"
++			}
++			resets := unix(base + "-reset-at")
++			if resets.IsZero() && !observedAt.IsZero() {
++				if after, okAfter := number(base + "-reset-after-seconds"); okAfter && after >= 0 && after < 1e8 {
++					resets = observedAt.Add(time.Duration(after) * time.Second).UTC()
++				}
++			}
++			windows = append(windows, QuotaWindow{Label: label, UsedPercent: clampPercent(used), ResetsAt: resets})
++		}
++	}
++	sort.Slice(windows, func(i, j int) bool { return windows[i].Label < windows[j].Label })
++	return windows
++}
++
++func windowLabel(name string) string {
++	name = strings.ReplaceAll(name, "_", " ")
++	if len(name) > 40 {
++		name = name[:40]
++	}
++	return name + " window"
++}
++
++func minutesLabel(minutes float64) string {
++	switch {
++	case minutes >= 1440 && math.Mod(minutes, 1440) == 0:
++		return strconv.Itoa(int(minutes/1440)) + "d"
++	case minutes >= 60 && math.Mod(minutes, 60) == 0:
++		return strconv.Itoa(int(minutes/60)) + "h"
++	default:
++		return strconv.Itoa(int(minutes)) + "m"
++	}
++}
++
++func clampPercent(p float64) float64 {
++	return math.Max(0, math.Min(100, math.Round(p*10)/10))
++}
+diff --git a/internal/cliproxy/quota_test.go b/internal/cliproxy/quota_test.go
+new file mode 100644
+index 0000000..95a1abf
+--- /dev/null
++++ b/internal/cliproxy/quota_test.go
+@@ -0,0 +1,35 @@
++package cliproxy
++
++import (
++	"testing"
++	"time"
++)
++
++func TestQuotaWindows(t *testing.T) {
++	observed := time.Date(2026, 10, 29, 12, 0, 0, 0, time.UTC)
++	got := QuotaWindows(map[string]string{
++		"Anthropic-Ratelimit-Unified-5h-Utilization": "0.425",
++		"Anthropic-Ratelimit-Unified-5h-Reset":       "1893456000",
++		"Anthropic-Ratelimit-Unified-7d-Utilization": "1.7",
++		"Anthropic-Ratelimit-Unified-Status":         "allowed",
++		"X-Codex-Secondary-Used-Percent":             "12",
++		"X-Codex-Secondary-Window-Minutes":           "10080",
++		"X-Codex-Secondary-Reset-After-Seconds":      "3600",
++		"X-Codex-Primary-Used-Percent":               "not-a-number",
++	}, observed)
++	if len(got) != 3 {
++		t.Fatalf("windows = %+v", got)
++	}
++	if got[0].Label != "5h window" || got[0].UsedPercent != 42.5 || !got[0].ResetsAt.Equal(time.Unix(1893456000, 0)) {
++		t.Fatalf("5h = %+v", got[0])
++	}
++	if got[1].Label != "7d (secondary)" || got[1].UsedPercent != 12 || !got[1].ResetsAt.Equal(observed.Add(time.Hour)) {
++		t.Fatalf("codex = %+v", got[1])
++	}
++	if got[2].Label != "7d window" || got[2].UsedPercent != 100 {
++		t.Fatalf("7d clamp = %+v", got[2])
++	}
++	if len(QuotaWindows(nil, time.Time{})) != 0 {
++		t.Fatal("nil signals")
++	}
++}
+diff --git a/internal/mock/mock.go b/internal/mock/mock.go
+index db0af38..b3f44cf 100644
+--- a/internal/mock/mock.go
++++ b/internal/mock/mock.go
+@@ -2,7 +2,10 @@
+ package mock
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
+ 	"encoding/json"
++	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"os"
+@@ -15,6 +18,13 @@ type Server struct {
+ 	mu                          sync.Mutex
+ 	Secret, Key, Config, Status string
+ 	Connected, Disabled         bool
++	// Limits stores access.api-key-limits as JSON; nil means the section is absent.
++	Limits []byte
++}
++
++func keyID(key string) string {
++	s := sha256.Sum256([]byte(key))
++	return hex.EncodeToString(s[:])[:16]
+ }
+ 
+ func New() *Server {
+@@ -96,7 +106,8 @@ func (s *Server) Handler() http.Handler {
+ 			}
+ 			files := []any{}
+ 			if s.Connected {
+-				files = append(files, map[string]any{"name": "mock.json", "provider": "codex", "email": "demo@example.invalid", "disabled": s.Disabled, "status": "active", "refresh_token": "MUST-NOT-LEAK", "id_token": map[string]string{"plan_type": "plus"}})
++				files = append(files, map[string]any{"name": "mock.json", "provider": "codex", "email": "demo@example.invalid", "disabled": s.Disabled, "status": "active", "refresh_token": "MUST-NOT-LEAK", "id_token": map[string]string{"plan_type": "plus"}, "auth_index": "mock-index",
++					"quota": map[string]any{"signals": map[string]string{"X-Codex-Primary-Used-Percent": "42", "X-Codex-Primary-Window-Minutes": "300", "X-Codex-Primary-Reset-At": "1893456000", "X-Codex-Plan-Type": "MUST-NOT-LEAK-EITHER"}}})
+ 			}
+ 			send(map[string]any{"files": files})
+ 		case "/v8/management/credentials/models":
+@@ -108,6 +119,49 @@ func (s *Server) Handler() http.Handler {
+ 			send(map[string]bool{"ok": true})
+ 		case "/v8/management/observability/logs":
+ 			send(map[string]any{"lines": []string{"INFO mock started", "ERROR Authorization: Bearer MUST-NOT-LEAK"}})
++		case "/v8/management/config/access/api-key-limits":
++			if r.Method == "PUT" {
++				body, _ := io.ReadAll(r.Body)
++				if !json.Valid(body) {
++					w.WriteHeader(400)
++					return
++				}
++				s.Limits = body
++				send(map[string]string{"status": "ok"})
++				return
++			}
++			if s.Limits == nil {
++				w.WriteHeader(404)
++				send(map[string]string{"error": "not_found"})
++				return
++			}
++			_, _ = w.Write(s.Limits)
++		case "/v8/management/observability/usage/api-key-limits":
++			var limits struct {
++				Keys []struct {
++					Key          string  `json:"key"`
++					TokenLimit   int64   `json:"token-limit"`
++					AccountShare float64 `json:"account-share"`
++				} `json:"keys"`
++			}
++			_ = json.Unmarshal(s.Limits, &limits)
++			usage := []any{}
++			for _, k := range limits.Keys {
++				entry := map[string]any{"id": keyID(k.Key), "unlimited": k.TokenLimit <= 0, "token_limit": k.TokenLimit, "used_tokens": 10, "remaining_tokens": max(k.TokenLimit-10, 0), "period": "total"}
++				if k.AccountShare > 0 {
++					entry["account_share"] = k.AccountShare
++					entry["account_shares"] = []any{map[string]any{"auth_index": "mock-index", "window": "claude 5h", "used_percent": 3, "share_percent": k.AccountShare, "account_used_percent": 30, "resets_at": "2030-01-01T00:00:00Z"}}
++				}
++				usage = append(usage, entry)
++			}
++			send(map[string]any{"keys": usage})
++		case "/v8/management/observability/usage/analytics":
++			send(map[string]any{
++				"month": "2026-10", "months": []string{"2026-10"},
++				"rows":    []any{map[string]any{"key_id": keyID(s.Key), "auth_index": "mock-index", "provider": "claude", "model": "claude-opus-5-5", "requests": 3, "input_tokens": 1000000, "total_tokens": 1000000, "cost_usd": 4.0}},
++				"keys":    map[string]string{keyID(s.Key): "mock...only"},
++				"pricing": []any{map[string]any{"model": "claude-opus-5-5", "name": "Claude Opus 5.5", "input": 4, "output": 20}}, "pricing_source": "mock",
++			})
+ 		default:
+ 			w.WriteHeader(404)
+ 			send(map[string]string{"error": "not implemented in mock"})
+diff --git a/internal/providers/providers.go b/internal/providers/providers.go
+index 84f7611..4d81099 100644
+--- a/internal/providers/providers.go
++++ b/internal/providers/providers.go
+@@ -69,9 +69,12 @@ func (m *Manager) Start(ctx context.Context, provider, owner string) (Flow, erro
+ 			delete(m.flows, id)
+ 		}
+ 	}
+-	for _, f := range m.flows {
++	// Starting again replaces an abandoned login (e.g. after a page reload) instead of
++	// blocking Connect until it expires. Upstream also replaces its callback listener.
++	for id, f := range m.flows {
+ 		if f.Provider == provider {
+-			return Flow{}, errors.New("a login is already pending for this provider")
++			_ = m.Client.Do(ctx, "DELETE", "/v8/management/oauth/session?"+url.Values{"state": {f.State}}.Encode(), nil, nil)
++			delete(m.flows, id)
+ 		}
+ 	}
+ 	if len(m.flows) >= 20 {
+@@ -93,7 +96,8 @@ func (m *Manager) Start(ctx context.Context, provider, owner string) (Flow, erro
+ 	if e != nil {
+ 		return Flow{}, e
+ 	}
+-	ttl := 10 * time.Minute
++	// Upstream waits five minutes for a browser callback; keep the flow no longer than that.
++	ttl := 5 * time.Minute
+ 	if s.Device && out.Expires > 0 && out.Expires <= 1800 {
+ 		ttl = time.Duration(out.Expires) * time.Second
+ 	}
+@@ -138,7 +142,40 @@ func (m *Manager) Callback(ctx context.Context, id, owner, provider, raw string)
+ 	if e != nil {
+ 		return e
+ 	}
+-	s, _ := Find(provider)
++	return m.submit(ctx, f, raw)
++}
++
++// CallbackByURL submits a pasted callback URL to the pending login it belongs to,
++// matched by the provider callback address and the OAuth state. It works after a
++// page reload or a new WebUI session, as long as the login has not expired.
++func (m *Manager) CallbackByURL(ctx context.Context, raw string) (string, error) {
++	m.mu.Lock()
++	defer m.mu.Unlock()
++	if len(raw) > 8192 {
++		return "", errors.New("invalid callback")
++	}
++	u, e := url.Parse(raw)
++	if e != nil {
++		return "", errors.New("invalid callback URL")
++	}
++	state := u.Query().Get("state")
++	now := m.Now()
++	for _, s := range Catalog {
++		if s.Device || u.Host != s.CallbackHost || u.Path != s.CallbackPath {
++			continue
++		}
++		for _, f := range m.flows {
++			if f.Provider == s.ID && state != "" && f.State == state && now.Before(f.Expires) {
++				return s.ID, m.submit(ctx, f, raw)
++			}
++		}
++		return "", errors.New("no pending login matches this callback; start Connect again")
++	}
++	return "", errors.New("invalid callback URL")
++}
++
++func (m *Manager) submit(ctx context.Context, f *Flow, raw string) error {
++	s, _ := Find(f.Provider)
+ 	if f.Submitted || s.Device || len(raw) > 8192 {
+ 		return errors.New("invalid callback")
+ 	}
+diff --git a/internal/providers/providers_test.go b/internal/providers/providers_test.go
+index 4b43ec5..900f2db 100644
+--- a/internal/providers/providers_test.go
++++ b/internal/providers/providers_test.go
+@@ -128,3 +128,55 @@ func TestAllProviderEndpoints(t *testing.T) {
+ 		})
+ 	}
+ }
++func TestConnectReplacesPendingLogin(t *testing.T) {
++	m, _ := fixture(t)
++	ctx := context.Background()
++	first, e := m.Start(ctx, "codex", "owner")
++	if e != nil {
++		t.Fatal(e)
++	}
++	second, e := m.Start(ctx, "codex", "owner")
++	if e != nil {
++		t.Fatal("second Connect refused:", e)
++	}
++	if _, e = m.Status(ctx, first.ID, "owner", "codex"); e == nil {
++		t.Fatal("replaced login still pending")
++	}
++	if status, e := m.Status(ctx, second.ID, "owner", "codex"); e != nil || status != "waiting" {
++		t.Fatal(status, e)
++	}
++}
++func TestCallbackByURL(t *testing.T) {
++	m, _ := fixture(t)
++	ctx := context.Background()
++	f, e := m.Start(ctx, "codex", "old-session")
++	if e != nil {
++		t.Fatal(e)
++	}
++	for _, raw := range []string{"http://localhost:1455/auth/callback?state=wrong&code=x", "http://localhost:9999/auth/callback?state=mock-state&code=x", "http://localhost:1455/auth/callback?state=mock-state", "not a url%"} {
++		if _, e = m.CallbackByURL(ctx, raw); e == nil {
++			t.Fatal("accepted", raw)
++		}
++	}
++	provider, e := m.CallbackByURL(ctx, "http://localhost:1455/auth/callback?state=mock-state&code=private")
++	if e != nil || provider != "codex" {
++		t.Fatal(provider, e)
++	}
++	if _, e = m.CallbackByURL(ctx, "http://localhost:1455/auth/callback?state=mock-state&code=private"); e == nil {
++		t.Fatal("replay")
++	}
++	if status, e := m.Status(ctx, f.ID, "old-session", "codex"); e != nil || status != "connected" {
++		t.Fatal(status, e)
++	}
++}
++func TestCallbackByURLExpired(t *testing.T) {
++	m, _ := fixture(t)
++	ctx := context.Background()
++	if _, e := m.Start(ctx, "codex", "owner"); e != nil {
++		t.Fatal(e)
++	}
++	m.Now = func() time.Time { return time.Now().Add(6 * time.Minute) }
++	if _, e := m.CallbackByURL(ctx, "http://localhost:1455/auth/callback?state=mock-state&code=x"); e == nil {
++		t.Fatal("expired login accepted")
++	}
++}
+diff --git a/internal/web/limits.go b/internal/web/limits.go
+new file mode 100644
+index 0000000..5370b5e
+--- /dev/null
++++ b/internal/web/limits.go
+@@ -0,0 +1,375 @@
++package web
++
++import (
++	"context"
++	"net/http"
++	"regexp"
++	"strings"
++	"time"
++	"unicode"
++
++	"github.com/OzoneH3/CLIProxyAPI_unraid/internal/bootstrap"
++	"github.com/OzoneH3/CLIProxyAPI_unraid/internal/cliproxy"
++)
++
++// keyView is a limited client key as shown in the WebUI; the raw key is only
++// returned on creation and through the explicit reveal route.
++type keyView struct {
++	ID           string             `json:"id"`
++	Name         string             `json:"name"`
++	Hint         string             `json:"hint"`
++	Subscription string             `json:"subscription"`
++	TokenLimit   int64              `json:"token_limit"`
++	Period       string             `json:"period"`
++	AccountShare float64            `json:"account_share"`
++	Main         bool               `json:"main"`
++	Usage        *cliproxy.KeyUsage `json:"usage,omitempty"`
++}
++
++type limitInput struct {
++	ID           string  `json:"id"`
++	Name         string  `json:"name"`
++	Subscription string  `json:"subscription"`
++	TokenLimit   int64   `json:"token_limit"`
++	Period       string  `json:"period"`
++	AccountShare float64 `json:"account_share"`
++	Confirm      bool    `json:"confirm"`
++}
++
++// keyViews lists the main key and the limited keys with their budget state.
++// Account shares are labeled with account names instead of auth indexes.
++func (s *Server) keyViews(ctx context.Context, limits cliproxy.Limits) []keyView {
++	usage, _ := s.Client.KeyUsage(ctx)
++
++	labels := map[string]string{}
++	if accounts, e := s.Client.Accounts(ctx); e == nil {
++		for _, a := range accounts {
++			labels[a.Index] = accountLabel(a)
++		}
++	}
++	main := s.Client.Key()
++	views := []keyView{{ID: cliproxy.KeyID(main), Name: "Main key (WebUI)", Hint: keyHint(main), Main: true}}
++	for _, k := range limits.Keys {
++		v := keyView{ID: cliproxy.KeyID(k.Key), Name: k.Name, Hint: keyHint(k.Key), Subscription: k.Subscription, TokenLimit: k.TokenLimit, Period: k.Period, AccountShare: k.AccountShare}
++		if u, ok := usage[v.ID]; ok {
++			for i := range u.AccountShares {
++				sh := &u.AccountShares[i]
++				if sh.Account = labels[sh.AuthIndex]; sh.Account == "" {
++					sh.Account = "Removed account"
++				}
++			}
++			if u.AccountShares == nil {
++				u.AccountShares = []cliproxy.AccountShare{}
++			}
++			v.Usage = &u
++		}
++		views = append(views, v)
++	}
++	return views
++}
++
++var planName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9 _.-]{0,39}$`)
++
++func keyHint(key string) string {
++	if len(key) <= 12 {
++		return "••••"
++	}
++	return key[:7] + "••••" + key[len(key)-4:]
++}
++
++func validName(name string) bool {
++	if len(name) > 64 {
++		return false
++	}
++	for _, r := range name {
++		if unicode.IsControl(r) {
++			return false
++		}
++	}
++	return true
++}
++
++func validPeriod(period string) bool {
++	switch period {
++	case "", "total", "daily", "weekly", "monthly":
++		return true
++	}
++	d, e := time.ParseDuration(period)
++	return e == nil && d >= time.Minute && d <= 366*24*time.Hour
++}
++
++func validLimit(in limitInput, plans []cliproxy.Plan) string {
++	if !validName(in.Name) {
++		return "Name must be at most 64 characters"
++	}
++	if in.TokenLimit < 0 || in.TokenLimit > 1e13 {
++		return "Token limit is out of range"
++	}
++	if !validPeriod(in.Period) {
++		return "Period must be total, daily, weekly, monthly, or a duration like 5h"
++	}
++	if in.AccountShare < 0 || in.AccountShare > 100 {
++		return "Account share must be between 0 and 100 percent"
++	}
++	if in.Subscription != "" {
++		for _, p := range plans {
++			if p.Name == in.Subscription {
++				return ""
++			}
++		}
++		return "Unknown subscription plan"
++	}
++	return ""
++}
++
++func (s *Server) limitsAPI(w http.ResponseWriter, r *http.Request, path string) {
++	ctx := r.Context()
++	switch {
++	case path == "/api/limits" && r.Method == "GET":
++		limits, e := s.Client.Limits(ctx)
++		if e != nil {
++			problem(w, 502, "Key limits unavailable")
++			return
++		}
++		reply(w, 200, map[string]any{"plans": limits.Subscriptions, "keys": s.keyViews(ctx, limits)})
++	case path == "/api/limits/keys" && r.Method != "GET":
++		var in limitInput
++		if !decode(w, r, &in) {
++			return
++		}
++		in.Name, in.Subscription, in.Period = strings.TrimSpace(in.Name), strings.TrimSpace(in.Subscription), strings.TrimSpace(in.Period)
++		s.limitsMu.Lock()
++		defer s.limitsMu.Unlock()
++		limits, e := s.Client.Limits(ctx)
++		if e != nil {
++			problem(w, 502, "Key limits unavailable")
++			return
++		}
++		created := ""
++		switch r.Method {
++		case "POST":
++			if msg := validLimit(in, limits.Subscriptions); msg != "" {
++				problem(w, 400, msg)
++				return
++			}
++			if len(limits.Keys) >= 200 {
++				problem(w, 400, "Too many keys")
++				return
++			}
++			key, errKey := bootstrap.Secret("sk-cpa-")
++			if errKey != nil {
++				problem(w, 500, "Could not generate a key")
++				return
++			}
++			limits.Keys = append(limits.Keys, cliproxy.LimitedKey{Key: key, Name: in.Name, Subscription: in.Subscription, TokenLimit: in.TokenLimit, Period: in.Period, AccountShare: in.AccountShare})
++			created = key
++		case "PATCH", "DELETE":
++			idx := -1
++			for i, k := range limits.Keys {
++				if cliproxy.KeyID(k.Key) == in.ID {
++					idx = i
++				}
++			}
++			if idx < 0 {
++				problem(w, 404, "Unknown key")
++				return
++			}
++			if r.Method == "DELETE" {
++				if !in.Confirm {
++					problem(w, 400, "Confirm deletion first")
++					return
++				}
++				limits.Keys = append(limits.Keys[:idx], limits.Keys[idx+1:]...)
++				break
++			}
++			if msg := validLimit(in, limits.Subscriptions); msg != "" {
++				problem(w, 400, msg)
++				return
++			}
++			k := &limits.Keys[idx]
++			k.Name, k.Subscription, k.TokenLimit, k.Period, k.AccountShare = in.Name, in.Subscription, in.TokenLimit, in.Period, in.AccountShare
++		default:
++			problem(w, 405, "Method not allowed")
++			return
++		}
++		if e = s.Client.SaveLimits(ctx, limits); e != nil {
++			problem(w, 502, "Saving key limits failed")
++			return
++		}
++		if created != "" {
++			reply(w, 200, map[string]string{"id": cliproxy.KeyID(created), "key": created})
++			return
++		}
++		reply(w, 200, map[string]bool{"ok": true})
++	case strings.HasPrefix(path, "/api/limits/keys/") && r.Method == "GET":
++		id := strings.TrimPrefix(path, "/api/limits/keys/")
++		limits, e := s.Client.Limits(ctx)
++		if e != nil {
++			problem(w, 502, "Key limits unavailable")
++			return
++		}
++		for _, k := range limits.Keys {
++			if cliproxy.KeyID(k.Key) == id {
++				reply(w, 200, map[string]string{"key": k.Key})
++				return
++			}
++		}
++		problem(w, 404, "Unknown key")
++	case path == "/api/limits/plans" && r.Method == "PUT":
++		var in struct {
++			Plans []cliproxy.Plan `json:"plans"`
++		}
++		if !decode(w, r, &in) {
++			return
++		}
++		seen := map[string]bool{}
++		for i := range in.Plans {
++			p := &in.Plans[i]
++			p.Name, p.Period = strings.TrimSpace(p.Name), strings.TrimSpace(p.Period)
++			if !planName.MatchString(p.Name) || seen[p.Name] {
++				problem(w, 400, "Plan names must be unique: letters, digits, space, dot, dash or underscore")
++				return
++			}
++			if p.TokenLimit < 0 || p.TokenLimit > 1e13 || !validPeriod(p.Period) || p.AccountShare < 0 || p.AccountShare > 100 {
++				problem(w, 400, "Invalid plan limit or period")
++				return
++			}
++			seen[p.Name] = true
++		}
++		if len(in.Plans) > 50 {
++			problem(w, 400, "Too many plans")
++			return
++		}
++		s.limitsMu.Lock()
++		defer s.limitsMu.Unlock()
++		limits, e := s.Client.Limits(ctx)
++		if e != nil {
++			problem(w, 502, "Key limits unavailable")
++			return
++		}
++		for _, k := range limits.Keys {
++			if k.Subscription != "" && !seen[k.Subscription] {
++				problem(w, 400, "Plan \""+k.Subscription+"\" is still used by a key; change those keys first")
++				return
++			}
++		}
++		limits.Subscriptions = in.Plans
++		if e = s.Client.SaveLimits(ctx, limits); e != nil {
++			problem(w, 502, "Saving plans failed")
++			return
++		}
++		reply(w, 200, map[string]bool{"ok": true})
++	case path == "/api/usage" && r.Method == "GET":
++		s.usageOverview(w, r)
++	case path == "/api/analytics" && r.Method == "GET":
++		month := r.URL.Query().Get("month")
++		if month != "" {
++			if _, e := time.Parse("2006-01", month); e != nil {
++				problem(w, 400, "Month must be YYYY-MM")
++				return
++			}
++		}
++		a, e := s.Client.Analytics(ctx, month)
++		if e != nil {
++			problem(w, 502, "Analytics unavailable")
++			return
++		}
++		a.Keys = s.keyLabels(a.Keys)
++		accounts := map[string]string{}
++		if list, errAccounts := s.Client.Accounts(ctx); errAccounts == nil {
++			for _, acc := range list {
++				accounts[acc.Index] = accountLabel(acc)
++			}
++		}
++		reply(w, 200, map[string]any{"analytics": a, "accounts": accounts})
++	default:
++		problem(w, 404, "Not found")
++	}
++}
++
++// keyLabels names the WebUI main key and falls back to upstream labels.
++func (s *Server) keyLabels(upstream map[string]string) map[string]string {
++	labels := map[string]string{}
++	for id, label := range upstream {
++		labels[id] = label
++	}
++	labels[cliproxy.KeyID(s.Client.Key())] = "Main key (WebUI)"
++	return labels
++}
++
++func accountLabel(a cliproxy.Account) string {
++	if a.Email != "" {
++		return a.Provider + " · " + a.Email
++	}
++	return a.Provider
++}
++
++// usageOverview combines key budgets, this month's analytics and account limits.
++func (s *Server) usageOverview(w http.ResponseWriter, r *http.Request) {
++	ctx := r.Context()
++	a, e := s.Client.Analytics(ctx, "")
++	if e != nil {
++		problem(w, 502, "Usage unavailable")
++		return
++	}
++	limits, _ := s.Client.Limits(ctx)
++
++	accounts, _ := s.Client.Accounts(ctx)
++
++	type totals struct {
++		Requests int64   `json:"requests"`
++		Tokens   int64   `json:"tokens"`
++		CostUSD  float64 `json:"cost_usd"`
++	}
++	byKey, byAuth := map[string]*totals{}, map[string]*totals{}
++	add := func(m map[string]*totals, id string, row cliproxy.UsageRow) {
++		t := m[id]
++		if t == nil {
++			t = &totals{}
++			m[id] = t
++		}
++		t.Requests += row.Requests
++		t.Tokens += row.TotalTokens
++		t.CostUSD += row.CostUSD
++	}
++	for _, row := range a.Rows {
++		add(byKey, row.KeyID, row)
++		add(byAuth, row.AuthIndex, row)
++	}
++
++	type keyRow struct {
++		keyView
++		Month totals `json:"month"`
++	}
++	keys := []keyRow{}
++	for _, v := range s.keyViews(ctx, limits) {
++		keys = append(keys, keyRow{keyView: v})
++	}
++	for i := range keys {
++		if t := byKey[keys[i].ID]; t != nil {
++			keys[i].Month = *t
++		}
++	}
++
++	type accountRow struct {
++		ID       string                 `json:"id"`
++		Label    string                 `json:"label"`
++		Plan     string                 `json:"plan"`
++		Status   string                 `json:"status"`
++		Disabled bool                   `json:"disabled"`
++		Limits   []cliproxy.QuotaWindow `json:"limits"`
++		Month    totals                 `json:"month"`
++	}
++	rows := []accountRow{}
++	for _, acc := range accounts {
++		row := accountRow{ID: acc.ID, Label: accountLabel(acc), Plan: acc.Plan, Status: acc.Status, Disabled: acc.Disabled, Limits: acc.Limits}
++		if row.Limits == nil {
++			row.Limits = []cliproxy.QuotaWindow{}
++		}
++		if t := byAuth[acc.Index]; t != nil {
++			row.Month = *t
++		}
++		rows = append(rows, row)
++	}
++	reply(w, 200, map[string]any{"month": a.Month, "keys": keys, "accounts": rows})
++}
+diff --git a/internal/web/limits_test.go b/internal/web/limits_test.go
+new file mode 100644
+index 0000000..5b3ce7c
+--- /dev/null
++++ b/internal/web/limits_test.go
+@@ -0,0 +1,200 @@
++package web
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/OzoneH3/CLIProxyAPI_unraid/internal/cliproxy"
++	"github.com/OzoneH3/CLIProxyAPI_unraid/internal/mock"
++	"github.com/OzoneH3/CLIProxyAPI_unraid/internal/security"
++	"golang.org/x/crypto/bcrypt"
++)
++
++func limitsFixture(t *testing.T) (*mock.Server, func(method, path, body string) *httptest.ResponseRecorder) {
++	t.Helper()
++	m := mock.New()
++	m.Connected = true
++	up := httptest.NewServer(m.Handler())
++	t.Cleanup(up.Close)
++	h, _ := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
++	s := New(cliproxy.New(up.URL, m.Secret, m.Key, ""), security.New(h, false))
++	s.Alive.Store(true)
++	handler := s.Handler()
++	raw := func(method, path, body string, cookie *http.Cookie, csrf string) *httptest.ResponseRecorder {
++		r := httptest.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
++		r.Header.Set("Origin", "http://localhost")
++		r.Header.Set("Content-Type", "application/json")
++		r.Header.Set("X-CSRF-Token", csrf)
++		if cookie != nil {
++			r.AddCookie(cookie)
++		}
++		w := httptest.NewRecorder()
++		handler.ServeHTTP(w, r)
++		return w
++	}
++	w := raw("POST", "/api/login", `{"password":"correct-password"}`, nil, "")
++	cookie := w.Result().Cookies()[0]
++	var login map[string]string
++	_ = json.Unmarshal(w.Body.Bytes(), &login)
++	return m, func(method, path, body string) *httptest.ResponseRecorder {
++		return raw(method, path, body, cookie, login["csrf"])
++	}
++}
++
++func decodeBody(t *testing.T, w *httptest.ResponseRecorder, out any) {
++	t.Helper()
++	if w.Code != 200 {
++		t.Fatalf("status %d: %s", w.Code, w.Body)
++	}
++	if e := json.Unmarshal(w.Body.Bytes(), out); e != nil {
++		t.Fatal(e)
++	}
++}
++
++func TestKeyAndPlanManagement(t *testing.T) {
++	m, do := limitsFixture(t)
++	var list struct {
++		Plans []cliproxy.Plan `json:"plans"`
++		Keys  []keyView       `json:"keys"`
++	}
++	decodeBody(t, do("GET", "/api/limits", ""), &list)
++	if len(list.Keys) != 1 || !list.Keys[0].Main || strings.Contains(list.Keys[0].Hint, m.Key) {
++		t.Fatalf("initial keys = %+v", list.Keys)
++	}
++
++	if w := do("POST", "/api/limits/keys", `{"name":"alice","subscription":"pro"}`); w.Code != 400 {
++		t.Fatal("unknown plan accepted", w.Code)
++	}
++	if w := do("PUT", "/api/limits/plans", `{"plans":[{"name":"pro","token-limit":1000,"period":"monthly"},{"name":"pro"}]}`); w.Code != 400 {
++		t.Fatal("duplicate plan accepted", w.Code)
++	}
++	if w := do("PUT", "/api/limits/plans", `{"plans":[{"name":"pro","token-limit":1000,"period":"fortnightly"}]}`); w.Code != 400 {
++		t.Fatal("bad period accepted", w.Code)
++	}
++	decodeBody(t, do("PUT", "/api/limits/plans", `{"plans":[{"name":"pro","token-limit":1000,"period":"monthly"}]}`), &map[string]bool{})
++
++	var created struct{ ID, Key string }
++	decodeBody(t, do("POST", "/api/limits/keys", `{"name":"alice","subscription":"pro"}`), &created)
++	if !strings.HasPrefix(created.Key, "sk-cpa-") || created.ID != cliproxy.KeyID(created.Key) {
++		t.Fatalf("created = %+v", created)
++	}
++	var small struct{ ID, Key string }
++	decodeBody(t, do("POST", "/api/limits/keys", `{"name":"trial","token_limit":500,"period":"5h"}`), &small)
++
++	decodeBody(t, do("GET", "/api/limits", ""), &list)
++	if len(list.Keys) != 3 || list.Keys[1].Subscription != "pro" || list.Keys[2].TokenLimit != 500 || list.Keys[2].Usage == nil || list.Keys[2].Usage.RemainingTokens != 490 {
++		t.Fatalf("keys = %+v", list.Keys)
++	}
++	if strings.Contains(do("GET", "/api/limits", "").Body.String(), created.Key) {
++		t.Fatal("list exposes raw key")
++	}
++	var revealed struct{ Key string }
++	decodeBody(t, do("GET", "/api/limits/keys/"+created.ID, ""), &revealed)
++	if revealed.Key != created.Key {
++		t.Fatal("reveal returned wrong key")
++	}
++
++	if w := do("PUT", "/api/limits/plans", `{"plans":[]}`); w.Code != 400 {
++		t.Fatal("removed a plan still in use", w.Code)
++	}
++	decodeBody(t, do("PATCH", "/api/limits/keys", `{"id":"`+created.ID+`","name":"alice","token_limit":2000,"period":"daily"}`), &map[string]bool{})
++	decodeBody(t, do("PUT", "/api/limits/plans", `{"plans":[]}`), &map[string]bool{})
++	if w := do("DELETE", "/api/limits/keys", `{"id":"`+small.ID+`"}`); w.Code != 400 {
++		t.Fatal("delete without confirmation accepted", w.Code)
++	}
++	decodeBody(t, do("DELETE", "/api/limits/keys", `{"id":"`+small.ID+`","confirm":true}`), &map[string]bool{})
++
++	var saved cliproxy.Limits
++	if e := json.Unmarshal(m.Limits, &saved); e != nil {
++		t.Fatal(e)
++	}
++	if len(saved.Keys) != 1 || saved.Keys[0].Key != created.Key || saved.Keys[0].Subscription != "" || saved.Keys[0].TokenLimit != 2000 || saved.Keys[0].Period != "daily" || len(saved.Subscriptions) != 0 {
++		t.Fatalf("saved limits = %+v", saved)
++	}
++}
++
++func TestUsageOverviewAndAnalytics(t *testing.T) {
++	m, do := limitsFixture(t)
++	var overview struct {
++		Month string `json:"month"`
++		Keys  []struct {
++			Main  bool `json:"main"`
++			Month struct {
++				Tokens  int64   `json:"tokens"`
++				CostUSD float64 `json:"cost_usd"`
++			} `json:"month"`
++		} `json:"keys"`
++		Accounts []struct {
++			Label  string                 `json:"label"`
++			Limits []cliproxy.QuotaWindow `json:"limits"`
++			Month  struct {
++				Requests int64 `json:"requests"`
++			} `json:"month"`
++		} `json:"accounts"`
++	}
++	w := do("GET", "/api/usage", "")
++	decodeBody(t, w, &overview)
++	if strings.Contains(w.Body.String(), "MUST-NOT-LEAK") || strings.Contains(w.Body.String(), m.Key) {
++		t.Fatal("overview leaks secrets")
++	}
++	if overview.Month != "2026-10" || !overview.Keys[0].Main || overview.Keys[0].Month.Tokens != 1000000 || overview.Keys[0].Month.CostUSD != 4 {
++		t.Fatalf("keys = %+v", overview.Keys)
++	}
++	if len(overview.Accounts) != 1 || overview.Accounts[0].Month.Requests != 3 || len(overview.Accounts[0].Limits) != 1 || overview.Accounts[0].Limits[0].UsedPercent != 42 || overview.Accounts[0].Limits[0].Label != "5h (primary)" {
++		t.Fatalf("accounts = %+v", overview.Accounts)
++	}
++
++	var analytics struct {
++		Analytics cliproxy.Analytics `json:"analytics"`
++		Accounts  map[string]string  `json:"accounts"`
++	}
++	decodeBody(t, do("GET", "/api/analytics?month=2026-10", ""), &analytics)
++	if analytics.Analytics.Keys[cliproxy.KeyID(m.Key)] != "Main key (WebUI)" || analytics.Accounts["mock-index"] != "codex · demo@example.invalid" {
++		t.Fatalf("analytics = %+v", analytics)
++	}
++	if w := do("GET", "/api/analytics?month=bad", ""); w.Code != 400 {
++		t.Fatal("bad month accepted")
++	}
++}
++
++func TestAccountShareKeys(t *testing.T) {
++	m, do := limitsFixture(t)
++	if w := do("POST", "/api/limits/keys", `{"name":"laptop","account_share":120}`); w.Code != 400 {
++		t.Fatal("share above 100 accepted", w.Code)
++	}
++	if w := do("PUT", "/api/limits/plans", `{"plans":[{"name":"tenth","account-share":-1}]}`); w.Code != 400 {
++		t.Fatal("negative plan share accepted", w.Code)
++	}
++	decodeBody(t, do("PUT", "/api/limits/plans", `{"plans":[{"name":"tenth","account-share":10}]}`), &map[string]bool{})
++	var created struct{ ID, Key string }
++	decodeBody(t, do("POST", "/api/limits/keys", `{"name":"laptop","account_share":12.5}`), &created)
++
++	w := do("GET", "/api/limits", "")
++	var list struct {
++		Plans []cliproxy.Plan `json:"plans"`
++		Keys  []keyView       `json:"keys"`
++	}
++	decodeBody(t, w, &list)
++	if strings.Contains(w.Body.String(), "mock-index") {
++		t.Fatal("auth index exposed to the browser")
++	}
++	k := list.Keys[1]
++	if list.Plans[0].AccountShare != 10 || k.AccountShare != 12.5 || k.Usage == nil || len(k.Usage.AccountShares) != 1 {
++		t.Fatalf("plans=%+v key=%+v", list.Plans, k)
++	}
++	if sh := k.Usage.AccountShares[0]; sh.Account != "codex · demo@example.invalid" || sh.Window != "claude 5h" || sh.SharePercent != 12.5 || sh.AccountUsedPercent != 30 {
++		t.Fatalf("share = %+v", sh)
++	}
++
++	decodeBody(t, do("PATCH", "/api/limits/keys", `{"id":"`+created.ID+`","name":"laptop","subscription":"tenth"}`), &map[string]bool{})
++	var saved cliproxy.Limits
++	if e := json.Unmarshal(m.Limits, &saved); e != nil {
++		t.Fatal(e)
++	}
++	if saved.Keys[0].AccountShare != 0 || saved.Keys[0].Subscription != "tenth" {
++		t.Fatalf("saved = %+v", saved.Keys[0])
++	}
++}
+diff --git a/internal/web/server.go b/internal/web/server.go
+index dc2ec30..fa32d99 100644
+--- a/internal/web/server.go
++++ b/internal/web/server.go
+@@ -6,6 +6,7 @@ import (
+ 	"net/http"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -22,6 +23,8 @@ type Server struct {
+ 	Alive     atomic.Bool
+ 	APIPort   int
+ 	Started   time.Time
++	// limitsMu serializes read-modify-write of access.api-key-limits.
++	limitsMu sync.Mutex
+ }
+ 
+ func New(c *cliproxy.Client, a *security.Auth) *Server {
+@@ -215,8 +218,25 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
+ 			return
+ 		}
+ 		reply(w, 200, logs)
++	case strings.HasPrefix(path, "/api/limits") || path == "/api/usage" || path == "/api/analytics":
++		s.limitsAPI(w, r, path)
+ 	case strings.HasPrefix(path, "/api/providers/"):
+ 		parts := strings.Split(strings.TrimPrefix(path, "/api/providers/"), "/")
++		if len(parts) == 1 && parts[0] == "callback" && r.Method == "POST" {
++			var in struct {
++				URL string `json:"url"`
++			}
++			if !decode(w, r, &in) {
++				return
++			}
++			provider, e := s.Providers.CallbackByURL(r.Context(), in.URL)
++			if e != nil {
++				problem(w, 400, "Callback rejected: "+e.Error())
++				return
++			}
++			reply(w, 200, map[string]string{"provider": provider})
++			return
++		}
+ 		if len(parts) < 2 {
+ 			problem(w, 404, "Not found")
+ 			return
+diff --git a/internal/web/server_test.go b/internal/web/server_test.go
+index 99708ce..b4d418f 100644
+--- a/internal/web/server_test.go
++++ b/internal/web/server_test.go
+@@ -78,3 +78,44 @@ func TestAuthenticatedBoundary(t *testing.T) {
+ 		t.Fatal("logout did not revoke")
+ 	}
+ }
++func TestPasteCallbackRoute(t *testing.T) {
++	m := mock.New()
++	up := httptest.NewServer(m.Handler())
++	defer up.Close()
++	h, _ := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
++	s := New(cliproxy.New(up.URL, m.Secret, m.Key, ""), security.New(h, false))
++	s.Alive.Store(true)
++	handler := s.Handler()
++	do := func(method, path, body string, cookie *http.Cookie, csrf string) *httptest.ResponseRecorder {
++		r := httptest.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
++		r.Header.Set("Origin", "http://localhost")
++		r.Header.Set("Content-Type", "application/json")
++		r.Header.Set("X-CSRF-Token", csrf)
++		if cookie != nil {
++			r.AddCookie(cookie)
++		}
++		w := httptest.NewRecorder()
++		handler.ServeHTTP(w, r)
++		return w
++	}
++	w := do("POST", "/api/login", `{"password":"correct-password"}`, nil, "")
++	cookie := w.Result().Cookies()[0]
++	var login map[string]string
++	_ = json.Unmarshal(w.Body.Bytes(), &login)
++	csrf := login["csrf"]
++	body := `{"url":"http://localhost:1455/auth/callback?state=mock-state&code=x"}`
++	if w = do("POST", "/api/providers/callback", body, cookie, csrf); w.Code != 400 {
++		t.Fatal("callback without pending login accepted", w.Code)
++	}
++	for i := 0; i < 2; i++ {
++		if w = do("POST", "/api/providers/codex/connect", `{}`, cookie, csrf); w.Code != 200 {
++			t.Fatal("connect", i, w.Code, w.Body)
++		}
++	}
++	if w = do("POST", "/api/providers/callback", body, cookie, ""); w.Code != 403 {
++		t.Fatal("missing CSRF accepted", w.Code)
++	}
++	if w = do("POST", "/api/providers/callback", body, cookie, csrf); w.Code != 200 || !strings.Contains(w.Body.String(), `"codex"`) {
++		t.Fatal(w.Code, w.Body)
++	}
++}
+diff --git a/web/static/app.js b/web/static/app.js
+index d664300..59f5f3a 100644
+--- a/web/static/app.js
++++ b/web/static/app.js
+@@ -26,12 +26,13 @@ async function providers() {
+   const [cards, accounts] = await Promise.all([api('providers'), api('accounts')]);
+   $('provider-cards').replaceChildren();
+   cards.forEach(p => { const card = element('article', ''); const connected = accounts.some(a => a.provider === p.id && !a.disabled); card.append(element('h2', p.name), element('p', p.description), element('p', connected ? 'Connected' : 'Not connected'), button(connected ? 'Reconnect' : 'Connect', () => connect(p))); $('provider-cards').append(card); });
+-  $('accounts').replaceChildren(); $('overview-accounts').replaceChildren(...accounts.map(a => element('li', a.provider + (a.email ? ' · ' + a.email : '') + ' · ' + (a.disabled ? 'Disabled' : a.status)))); if (!accounts.length) $('overview-accounts').append(element('li', 'No accounts connected yet. Open Providers to get started.'));
++  $('accounts').replaceChildren();
+   if (!accounts.length) $('accounts').append(element('p', 'No accounts connected yet.'));
+   accounts.forEach(a => { const card = element('article', ''); card.append(element('h3', a.provider), element('p', (a.email || 'Account') + (a.plan ? ' · ' + a.plan : '') + ' · ' + (a.disabled ? 'Disabled' : a.status)), button(a.disabled ? 'Enable' : 'Disable', async () => { await api('accounts', 'PATCH', {id:a.id, disabled:!a.disabled}); await providers(); }), button('Models', async () => { const models = await api('accounts/' + a.id + '/models'); message(models.length ? models.join(', ') : 'No models reported for this account.'); }), button('Disconnect', async () => { if (!confirm('Disconnect this account and remove its saved credential?')) return; await api('accounts', 'DELETE', {id:a.id, confirm:true}); await providers(); await refresh(); })); $('accounts').append(card); });
+ }
+ async function connect(p) {
+-  if (flow) { message('Finish the current login or wait for it to expire before starting another.'); return; }
++  // Starting again replaces any pending login on the server.
++  clearTimeout(timer); flow = null;
+   const result = await api('providers/' + p.id + '/connect', 'POST', {});
+   flow = {...result, provider:p.id, name:p.name}; $('flow').hidden = false; $('flow-title').textContent = 'Connect ' + p.name;
+   $('auth-link').href = flow.url; $('flow-status').textContent = 'Waiting for authentication'; $('callback-form').hidden = flow.device; $('cancel-flow').hidden = false;
+@@ -47,6 +48,15 @@ async function poll() {
+     timer = setTimeout(poll, 2500);
+   } catch (e) { message(e.message); $('flow-status').textContent = 'Connection stopped'; $('cancel-flow').hidden = true; flow = null; }
+ }
++// Waits for a provider account to appear after a callback pasted outside the login box.
++async function watchProvider(provider, attempts = 40) {
++  for (let i = 0; i < attempts; i++) {
++    await new Promise(r => setTimeout(r, 2500));
++    const accounts = await api('accounts');
++    if (accounts.some(a => a.provider === provider && !a.disabled)) { await providers(); await refresh(); message('Account connected. Your API is ready.'); return; }
++  }
++  message('No account appeared yet. Check Logs, or start Connect again.');
++}
+ async function copy(text) {
+   if (navigator.clipboard && window.isSecureContext) { await navigator.clipboard.writeText(text); message('Copied.'); return; }
+   // Clipboard API requires HTTPS; this local fallback supports Unraid HTTP.
+@@ -56,6 +66,11 @@ async function copy(text) {
+ $('login-form').addEventListener('submit', action(async () => { const data = await api('login', 'POST', {password:$('password').value}); $('password').value = ''; csrf = data.csrf; await signedIn(); }));
+ $('logout').addEventListener('click', action(async () => { await api('logout', 'POST', {}); signedOut(); }));
+ $('callback-form').addEventListener('submit', action(async () => { if (!flow) return; await api('providers/' + flow.provider + '/callback/' + flow.id, 'POST', {url:$('callback').value.trim()}); $('callback').value = ''; message('Callback submitted. Waiting for credential storage.'); }));
++$('paste-callback-form').addEventListener('submit', action(async () => {
++  const d = await api('providers/callback', 'POST', {url:$('paste-callback-url').value.trim()}); $('paste-callback-url').value = '';
++  message('Callback submitted. Waiting for credential storage.');
++  if (!flow || flow.provider !== d.provider) await watchProvider(d.provider);
++}));
+ document.querySelectorAll('[data-page]').forEach(b => b.addEventListener('click', action(async () => { document.querySelectorAll('.page').forEach(p => p.hidden = p.id !== b.dataset.page); document.querySelectorAll('[data-page]').forEach(n => n.classList.toggle('selected', n === b)); if (b.dataset.page === 'providers') await providers(); })));
+ document.querySelectorAll('.copy-url').forEach(b => b.addEventListener('click', action(() => copy(baseURL))));
+ document.querySelectorAll('.copy-key').forEach(b => b.addEventListener('click', action(async () => { const d = await api('key'); await copy(d.key); })));
+diff --git a/web/static/index.html b/web/static/index.html
+index d6488c6..c1327b1 100644
+--- a/web/static/index.html
++++ b/web/static/index.html
+@@ -1,11 +1,11 @@
+ <!doctype html>
+-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CLIProxyAPI · Unraid</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script></head>
++<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>CLIProxyAPI · Unraid</title><link rel="stylesheet" href="/style.css"><script defer src="/app.js"></script><script defer src="/usage.js"></script></head>
+ <body><header><div class="mark">C<span>↗</span></div><div><strong>CLIProxyAPI</strong><small>Your AI connections, in one place</small></div><button id="logout" hidden>Sign out</button></header>
+ <main><div id="notice" role="status" aria-live="polite"></div>
+ <section id="login"><p class="eyebrow">WELCOME TO YOUR SERVER</p><h1>A single endpoint.<br>Your connected accounts.</h1><p>Sign in with the WebUI password you chose in Unraid.</p><form id="login-form"><label for="password">WebUI password</label><input id="password" type="password" required autocomplete="current-password" maxlength="72"><button type="submit">Sign in →</button></form></section>
+-<div id="app" hidden><nav aria-label="Pages"><button data-page="dashboard" class="selected">Overview</button><button data-page="providers">Providers</button><button data-page="access">API Access</button><button data-page="logs">Logs</button></nav>
+-<section id="dashboard" class="page"><p class="eyebrow">YOUR GATEWAY</p><h1>Ready when you are.</h1><div class="grid"><article><h2>CLIProxyAPI</h2><p id="status">Starting</p><small id="version"></small></article><article><h2>Proxy endpoint</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button></article></div><article><h2>Available models</h2><p>Models appear after you connect a provider.</p><button id="test">Test API</button><button id="refresh-models">Refresh Models</button><ul id="models"></ul></article><article><h2>Provider accounts</h2><ul id="overview-accounts"></ul></article><article><h2>Client API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button></article></section>
+-<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
++<div id="app" hidden><nav aria-label="Pages"><button data-page="dashboard" class="selected">Overview</button><button data-page="providers">Providers</button><button data-page="access">API Access</button><button data-page="keys">API Keys</button><button data-page="analytics">Analytics</button><button data-page="logs">Logs</button></nav>
++<section id="dashboard" class="page"><p class="eyebrow">YOUR GATEWAY</p><h1>Ready when you are.</h1><div class="grid"><article><h2>CLIProxyAPI</h2><p id="status">Starting</p><small id="version"></small></article><article><h2>Proxy endpoint</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button></article></div><article><h2>Available models</h2><p>Models appear after you connect a provider.</p><button id="test">Test API</button><button id="refresh-models">Refresh Models</button><ul id="models"></ul></article><article><h2>API key usage</h2><p>Token budgets of your keys and what each key used this month (<span id="usage-month"></span>). Cost is the Anthropic API list-price equivalent.</p><div id="usage-keys" class="usage-list"></div><button data-goto="keys">Manage API keys</button></article><article><h2>Connected accounts</h2><p>Subscription limits reported by each provider (refreshed whenever the account serves a request) and this month's usage through this proxy.</p><div id="usage-accounts" class="usage-list"></div></article><article><h2>Client API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button></article></section>
++<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><article id="paste-callback"><h2>Paste a callback URL</h2><p>Signed in on another computer and the browser ended on a localhost page that could not load? Click Connect first, sign in, then copy the complete URL from the browser address bar and paste it here. This works even after reloading this page, within 5 minutes of clicking Connect.</p><form id="paste-callback-form"><label for="paste-callback-url">Callback URL</label><input id="paste-callback-url" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:54545/callback?code=…&amp;state=…"><button type="submit">Submit callback URL</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
+ <section id="access" class="page" hidden><p class="eyebrow">PLUG INTO YOUR TOOLS</p><h1>API Access.</h1><article><h2>Base URL</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button><h2>API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button><p>Use this URL and key in an OpenAI-compatible client. Choose a model shown on Overview.</p><hr><p>Existing clients using this key will stop working after key regeneration.</p><button id="rotate" class="danger">Regenerate API Key</button></article></section>
+-<section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
++<section id="keys" class="page" hidden><p class="eyebrow">SHARE ACCESS SAFELY</p><h1>API keys.</h1><p>Create a key for each person or tool. A key can have full usage, a token budget, or follow a subscription plan. Changes apply immediately; a key that used up its budget gets HTTP 429 until it resets.</p><article><h2 id="key-form-title">Create a key</h2><form id="key-form"><input id="key-id" type="hidden"><label for="key-name">Name</label><input id="key-name" maxlength="64" placeholder="e.g. Laptop, Alice, CI"><label for="key-mode">Limit</label><select id="key-mode"><option value="full">Full usage (no limit)</option><option value="tokens">Token budget</option><option value="plan">Subscription plan</option></select><div id="key-tokens-fields" hidden><label for="key-limit">Tokens</label><input id="key-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="key-period">Resets</label><select id="key-period" class="period"><option value="total">Never (one-off budget)</option><option value="daily">Daily (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="monthly">Monthly (UTC)</option><option value="custom">Custom window…</option></select><input id="key-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="key-plan-fields" hidden><label for="key-plan">Plan</label><select id="key-plan"></select><p id="key-plan-empty" hidden>No plans yet. Add one under Subscription plans below.</p></div><label for="key-share">Share of each connected subscription account (optional)</label><input id="key-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10 — empty means no share limit"><p class="field-hint">Limits how much of each account's own limit windows (for example Claude's 5-hour and 7-day windows) this key may use. It resets when the account's window resets. A key on a plan uses the plan's share unless you set one here.</p><button type="submit" id="key-submit">Create key</button><button type="button" id="key-cancel" hidden>Cancel</button></form><div id="key-created" hidden><p>New key created. Copy it now and store it safely; you can copy it again later from the list.</p><code id="key-created-value"></code><button id="key-created-copy">Copy key</button></div></article><h2>Your keys</h2><div id="key-list" class="grid"></div><article><h2>Subscription plans</h2><p>Plans are reusable limits, for example "Starter: 1M tokens per month". Keys on a plan follow it; changing a plan updates every key on it.</p><div id="plan-list" class="usage-list"></div><form id="plan-form"><h3>Add a plan</h3><label for="plan-name">Plan name</label><input id="plan-name" maxlength="40" placeholder="e.g. starter"><label for="plan-limit">Tokens (optional)</label><input id="plan-limit" type="number" min="1" step="1" placeholder="e.g. 1000000 — empty means no token limit"><label for="plan-period">Resets</label><select id="plan-period" class="period"><option value="monthly">Monthly (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="daily">Daily (UTC)</option><option value="total">Never (one-off budget)</option><option value="custom">Custom window…</option></select><input id="plan-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden><label for="plan-share">Share of each connected subscription account (optional)</label><input id="plan-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10"><button type="submit">Add plan</button></form></article></section><section id="analytics" class="page" hidden><p class="eyebrow">WHAT IT WOULD COST</p><h1>Analytics.</h1><p>Tokens of all calls through this proxy and what they would cost at Anthropic API list prices, per month. Models without a known Anthropic price (for example OpenAI models) show tokens only. Cache writes are priced at the 5-minute rate.</p><label for="analytics-month">Month</label><select id="analytics-month"></select><div id="analytics-totals" class="grid"></div><article><h2>Per API key</h2><div class="table-wrap"><table id="analytics-keys"></table></div></article><article><h2>Per model</h2><div class="table-wrap"><table id="analytics-models"></table></div></article><article><h2>Per connected account</h2><div class="table-wrap"><table id="analytics-accounts"></table></div></article><details><summary>Anthropic API price table (USD per million tokens)</summary><p id="pricing-source"></p><div class="table-wrap"><table id="analytics-pricing"></table></div></details></section><section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
+ </main><footer>CLIProxyAPI is a third-party project. Provider availability and authentication methods are controlled by their respective services.</footer></body></html>
+diff --git a/web/static/style.css b/web/static/style.css
+index 614cbbf..ec90a50 100644
+--- a/web/static/style.css
++++ b/web/static/style.css
+@@ -1 +1,19 @@
+ :root{font-family:system-ui,-apple-system,sans-serif;color:#e6ebf1;background:#10151c;font-size:16px;color-scheme:dark}*{box-sizing:border-box}body{margin:0}header{display:flex;align-items:center;gap:16px;border-bottom:1px solid #2a333f;padding:24px 6vw}header strong{font-size:20px}small{display:block;color:#9babbc;margin-top:5px}.mark{border:1px solid #64748b;border-radius:12px;padding:10px;font-weight:800}.mark span{color:#9de4b7}#logout{margin-left:auto}main{max-width:1100px;margin:0 auto;padding:35px 24px 70px}h1{font-size:clamp(32px,5vw,52px);letter-spacing:-.045em;line-height:1.15;margin:16px 0 32px}h2{font-size:19px;margin-top:0}h3{margin-top:0}.eyebrow{font-size:12px;color:#9de4b7;letter-spacing:.16em;font-weight:700}p{line-height:1.6;color:#b4c1cf}article{background:#19212c;border:1px solid #303c4c;border-radius:14px;padding:25px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}.grid article{margin:0}button,a{cursor:pointer}button{font:inherit;border:1px solid #45556a;border-radius:7px;padding:10px 15px;background:#27384b;color:#eef5fa;margin:10px 10px 0 0}button:hover{background:#354b61}button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid #9de4b7;outline-offset:4px}button:disabled{opacity:.5;cursor:wait}a{color:#9de4b7}nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:40px}nav button{background:transparent;border-color:transparent}nav .selected{background:#254333;color:#bbf4cf}.danger{border-color:#925654;color:#ffb4ab}label{display:block;line-height:1.6;margin:16px 0 8px}input{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}#login{max-width:620px;margin:35px auto}#login-form{max-width:420px}code{display:block;overflow-wrap:anywhere;color:#b8e3f6;font-size:15px;margin:15px 0}#notice:empty{display:none}#notice{padding:14px;border-left:3px solid #9de4b7;background:#1a3028;margin-bottom:24px}li{padding:8px;border-bottom:1px solid #303c4c}ul{padding-left:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.7}footer{border-top:1px solid #2a333f;color:#8292a4;text-align:center;font-size:12px;padding:24px}hr{border:0;border-top:1px solid #354253;margin:30px 0}[hidden]{display:none!important}@media(max-width:600px){header{padding:20px}main{padding:24px 16px}article{padding:20px}nav{gap:0}nav button{padding:9px}h1{margin-bottom:24px}}
++select{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}
++meter{display:block;width:100%;height:12px;margin:8px 0}
++.usage-list{display:grid;gap:4px}
++.usage-row{padding:14px 0;border-bottom:1px solid #303c4c}
++.usage-row:last-child{border-bottom:0}
++.usage-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:baseline}
++.usage-head span{color:#b4c1cf}
++.usage-head button{margin:6px 0}
++.big{font-size:28px;font-weight:700;color:#e6ebf1;margin:4px 0}
++.table-wrap{overflow-x:auto}
++table{border-collapse:collapse;width:100%;font-size:14px}
++th,td{padding:9px 10px;border-bottom:1px solid #303c4c;text-align:left;white-space:nowrap}
++th{color:#9babbc;font-weight:600}
++td.num,th:not(:first-child){text-align:right}
++details{margin:18px 0}
++summary{cursor:pointer;color:#9de4b7;padding:10px 0}
++#plan-form{border-top:1px solid #354253;margin-top:20px;padding-top:10px}
++.field-hint{font-size:13px;color:#8fa0b3;margin:6px 0 0}
+diff --git a/web/static/usage.js b/web/static/usage.js
+new file mode 100644
+index 0000000..f89d3d1
+--- /dev/null
++++ b/web/static/usage.js
+@@ -0,0 +1,200 @@
++'use strict';
++// API keys, usage overview and analytics. Uses helpers from app.js.
++const fmtInt = new Intl.NumberFormat();
++const fmtUSD = new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2});
++const tokensText = n => fmtInt.format(n || 0);
++const usdText = n => fmtUSD.format(n || 0);
++const periodText = p => ({'': 'never resets', total: 'never resets', daily: 'per day', weekly: 'per week', monthly: 'per month'})[p || ''] || 'per ' + p;
++const whenText = t => { if (!t || t.startsWith('0001')) return ''; const d = new Date(t); return isNaN(d) ? '' : d.toLocaleString(); };
++let plans = [], keyRows = [];
++
++function meter(value, max, label) {
++  const m = document.createElement('meter'); m.min = 0; m.max = max || 1; m.value = Math.min(value, max || 1); m.low = (max || 1) * 0.7; m.high = (max || 1) * 0.9; m.optimum = 0;
++  if (label) m.setAttribute('aria-label', label); return m;
++}
++const shareText = s => +s.toFixed(2) + '%';
++function tokenText(k) {
++  const u = k.usage;
++  if (u && !u.unlimited) return tokensText(u.used_tokens) + ' / ' + tokensText(u.token_limit) + ' tokens · ' + periodText(u.period) + (u.resets_at && !u.resets_at.startsWith('0001') ? ' · resets ' + whenText(u.resets_at) : '');
++  if (k.token_limit > 0) return tokensText(k.token_limit) + ' tokens ' + periodText(k.period);
++  return '';
++}
++function limitText(k) {
++  if (k.main) return 'Full usage';
++  const parts = [];
++  if (k.subscription) parts.push('Plan ' + k.subscription);
++  const tokens = tokenText(k); if (tokens) parts.push(tokens);
++  const share = (k.usage && k.usage.account_share) || k.account_share;
++  if (share > 0) parts.push(shareText(share) + ' of each account');
++  return parts.length ? parts.join(' · ') : 'Full usage';
++}
++// Appends one line and meter per account window the key has used.
++function appendShares(el, k) {
++  const shares = (k.usage && k.usage.account_shares) || [];
++  shares.forEach(s => {
++    const line = element('div', ''); line.className = 'usage-head';
++    line.append(element('span', s.account + ' · ' + s.window), element('span', shareText(s.used_percent) + ' of ' + shareText(s.share_percent) + ' used (account at ' + shareText(s.account_used_percent) + ')' + (whenText(s.resets_at) ? ' · resets ' + whenText(s.resets_at) : '')));
++    el.append(line, meter(s.used_percent, s.share_percent, (k.name || k.hint) + ' share of ' + s.account + ' ' + s.window));
++    if (s.used_percent >= s.share_percent) el.append(element('small', 'Share used up — requests are rejected until this account window resets.'));
++  });
++  const share = (k.usage && k.usage.account_share) || k.account_share;
++  if (share > 0 && !shares.length) el.append(element('small', 'Account share: no subscription usage through this key in the current account windows yet.'));
++}
++
++// ---- Overview ----
++async function usageOverview() {
++  const d = await api('usage');
++  $('usage-month').textContent = d.month;
++  $('usage-keys').replaceChildren(...d.keys.map(k => {
++    const row = element('div', ''); row.className = 'usage-row';
++    const head = element('div', ''); head.className = 'usage-head';
++    head.append(element('strong', k.name || k.hint), element('span', limitText(k)));
++    row.append(head);
++    const u = k.usage;
++    if (u && !u.unlimited) { row.append(meter(u.used_tokens, u.token_limit, (k.name || k.hint) + ' budget')); if (u.remaining_tokens === 0) row.append(element('small', 'Budget used up — requests are rejected until it resets.')); }
++    appendShares(row, k);
++    row.append(element('small', 'This month: ' + tokensText(k.month.tokens) + ' tokens · ' + fmtInt.format(k.month.requests) + ' requests · ' + usdText(k.month.cost_usd)));
++    return row;
++  }));
++  if (!d.accounts.length) { $('usage-accounts').replaceChildren(element('p', 'No accounts connected yet. Open Providers to get started.')); return; }
++  $('usage-accounts').replaceChildren(...d.accounts.map(a => {
++    const row = element('div', ''); row.className = 'usage-row';
++    const head = element('div', ''); head.className = 'usage-head';
++    head.append(element('strong', a.label + (a.plan ? ' · ' + a.plan : '')), element('span', a.disabled ? 'Disabled' : a.status));
++    row.append(head);
++    if (!a.limits.length) row.append(element('small', 'No subscription limit reported yet; it appears after this account serves a request.'));
++    a.limits.forEach(l => {
++      const line = element('div', ''); line.className = 'usage-head';
++      line.append(element('span', l.label), element('span', l.used_percent + '% used' + (whenText(l.resets_at) ? ' · resets ' + whenText(l.resets_at) : '')));
++      row.append(line, meter(l.used_percent, 100, a.label + ' ' + l.label));
++    });
++    row.append(element('small', 'This month: ' + tokensText(a.month.tokens) + ' tokens · ' + fmtInt.format(a.month.requests) + ' requests · ' + usdText(a.month.cost_usd)));
++    return row;
++  }));
++}
++
++// ---- API keys ----
++function periodValue(select, custom) { return select.value === 'custom' ? custom.value.trim() : select.value; }
++function setPeriod(select, custom, value) {
++  const known = ['total', 'daily', 'weekly', 'monthly'];
++  const v = value || 'total';
++  select.value = known.includes(v) ? v : 'custom'; custom.hidden = select.value !== 'custom'; custom.value = known.includes(v) ? '' : v;
++}
++function syncKeyMode() {
++  const mode = $('key-mode').value;
++  $('key-tokens-fields').hidden = mode !== 'tokens'; $('key-plan-fields').hidden = mode !== 'plan';
++  $('key-plan-empty').hidden = plans.length > 0;
++}
++function resetKeyForm() {
++  $('key-form').reset(); $('key-id').value = ''; $('key-form-title').textContent = 'Create a key'; $('key-submit').textContent = 'Create key'; $('key-cancel').hidden = true;
++  setPeriod($('key-period'), $('key-period-custom'), 'total'); syncKeyMode();
++}
++function editKey(k) {
++  $('key-id').value = k.id; $('key-name').value = k.name; $('key-form-title').textContent = 'Edit ' + (k.name || k.hint); $('key-submit').textContent = 'Save changes'; $('key-cancel').hidden = false;
++  $('key-mode').value = k.subscription ? 'plan' : (k.token_limit > 0 ? 'tokens' : 'full');
++  $('key-limit').value = k.token_limit > 0 ? k.token_limit : ''; $('key-share').value = k.account_share > 0 ? k.account_share : ''; setPeriod($('key-period'), $('key-period-custom'), k.period);
++  if (k.subscription) $('key-plan').value = k.subscription;
++  syncKeyMode(); $('key-form').scrollIntoView({behavior: 'smooth'});
++}
++async function keysPage() {
++  const d = await api('limits');
++  plans = d.plans.map(p => ({name: p.name, token_limit: p['token-limit'] || 0, period: p.period || '', share: p['account-share'] || 0})); keyRows = d.keys;
++  $('key-plan').replaceChildren(...plans.map(p => { const o = element('option', p.name + ' · ' + planText(p)); o.value = p.name; return o; }));
++  syncKeyMode();
++  $('key-list').replaceChildren(...keyRows.map(k => {
++    const card = element('article', '');
++    card.append(element('h3', k.name || 'Unnamed key'), element('code', k.hint), element('p', limitText(k)));
++    if (k.usage && !k.usage.unlimited) card.append(meter(k.usage.used_tokens, k.usage.token_limit, (k.name || k.hint) + ' budget'));
++    appendShares(card, k);
++    if (k.main) {
++      card.append(element('p', 'Generated by this WebUI; rotate it on API Access.'), button('Copy key', async () => { const r = await api('key'); await copy(r.key); }));
++    } else {
++      card.append(
++        button('Copy key', async () => { const r = await api('limits/keys/' + k.id); await copy(r.key); }),
++        button('Edit limit', () => editKey(k)),
++        button('Delete', async () => { if (!confirm('Delete key "' + (k.name || k.hint) + '"? Clients using it stop working immediately.')) return; await api('limits/keys', 'DELETE', {id: k.id, confirm: true}); message('Key deleted.'); await keysPage(); }));
++      card.lastChild.classList.add('danger');
++    }
++    return card;
++  }));
++  $('plan-list').replaceChildren(...(plans.length ? plans.map(p => {
++    const row = element('div', ''); row.className = 'usage-head';
++    const used = keyRows.filter(k => k.subscription === p.name).length;
++    row.append(element('span', p.name + ' — ' + planText(p) + ' · ' + used + ' key' + (used === 1 ? '' : 's')),
++      button('Remove', async () => { await savePlans(plans.filter(x => x.name !== p.name)); message('Plan removed.'); await keysPage(); }));
++    return row;
++  }) : [element('p', 'No plans yet.')]));
++}
++const planText = p => [p.token_limit > 0 ? tokensText(p.token_limit) + ' tokens ' + periodText(p.period) : '', p.share > 0 ? shareText(p.share) + ' of each account' : ''].filter(Boolean).join(' · ') || 'full usage';
++const savePlans = list => api('limits/plans', 'PUT', {plans: list.map(x => ({name: x.name, 'token-limit': x.token_limit, period: x.period, 'account-share': x.share || 0}))});
++document.querySelectorAll('select.period').forEach(s => s.addEventListener('change', () => { s.nextElementSibling.hidden = s.value !== 'custom'; }));
++$('key-mode').addEventListener('change', syncKeyMode);
++$('key-cancel').addEventListener('click', resetKeyForm);
++$('key-form').addEventListener('submit', action(async () => {
++  const mode = $('key-mode').value, id = $('key-id').value;
++  const body = {name: $('key-name').value.trim(), subscription: '', token_limit: 0, period: '', account_share: parseFloat($('key-share').value) || 0};
++  if (body.account_share < 0 || body.account_share > 100) throw new Error('Account share must be between 0 and 100 percent.');
++  if (mode === 'tokens') { body.token_limit = parseInt($('key-limit').value, 10) || 0; body.period = periodValue($('key-period'), $('key-period-custom')); if (body.token_limit <= 0) throw new Error('Enter a token budget greater than 0.'); }
++  if (mode === 'plan') { body.subscription = $('key-plan').value; if (!body.subscription) throw new Error('Add a subscription plan first.'); }
++  if (body.period === 'total') body.period = '';
++  if (id) { await api('limits/keys', 'PATCH', {id, ...body}); message('Key updated.'); $('key-created').hidden = true; }
++  else { const r = await api('limits/keys', 'POST', body); $('key-created-value').textContent = r.key; $('key-created').hidden = false; message('Key created.'); }
++  resetKeyForm(); await keysPage();
++}));
++$('key-created-copy').addEventListener('click', action(() => copy($('key-created-value').textContent)));
++$('plan-form').addEventListener('submit', action(async () => {
++  const p = {name: $('plan-name').value.trim(), token_limit: parseInt($('plan-limit').value, 10) || 0, period: periodValue($('plan-period'), $('plan-period-custom')), share: parseFloat($('plan-share').value) || 0};
++  if (!p.name) throw new Error('Enter a plan name.');
++  if (p.token_limit <= 0 && p.share <= 0) throw new Error('Enter a token budget, an account share, or both.');
++  if (p.share < 0 || p.share > 100) throw new Error('Account share must be between 0 and 100 percent.');
++  if (p.period === 'total') p.period = '';
++  await savePlans(plans.filter(x => x.name !== p.name).concat([p]));
++  $('plan-form').reset(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly'); message('Plan saved.'); await keysPage();
++}));
++
++// ---- Analytics ----
++function table(id, headers, rows) {
++  const t = $(id); t.replaceChildren();
++  const head = document.createElement('tr'); headers.forEach(h => head.append(element('th', h))); t.append(head);
++  if (!rows.length) { const tr = document.createElement('tr'); const td = element('td', 'No usage recorded.'); td.colSpan = headers.length; tr.append(td); t.append(tr); return; }
++  rows.forEach(r => { const tr = document.createElement('tr'); r.forEach((c, i) => { const td = element('td', c); if (i > 0) td.className = 'num'; tr.append(td); }); t.append(tr); });
++}
++function group(rows, keyFn) {
++  const m = new Map();
++  rows.forEach(r => { const k = keyFn(r); const g = m.get(k) || {requests: 0, input: 0, cacheRead: 0, cacheWrite: 0, output: 0, total: 0, cost: 0, unpriced: 0}; g.requests += r.requests; g.input += r.input_tokens; g.cacheRead += r.cache_read_tokens; g.cacheWrite += r.cache_write_tokens; g.output += r.output_tokens; g.total += r.total_tokens; g.cost += r.cost_usd; g.unpriced += r.unpriced_tokens; m.set(k, g); });
++  return [...m.entries()].sort((a, b) => b[1].cost - a[1].cost || b[1].total - a[1].total);
++}
++const groupRow = (label, g) => [label, fmtInt.format(g.requests), tokensText(g.input), tokensText(g.cacheRead), tokensText(g.cacheWrite), tokensText(g.output), tokensText(g.total), g.unpriced === g.total && g.total > 0 ? 'n/a' : usdText(g.cost)];
++const groupHeaders = first => [first, 'Requests', 'Input', 'Cache read', 'Cache write', 'Output', 'Total tokens', 'API cost'];
++function card(title, value, note) { const a = element('article', ''); a.append(element('h2', title), element('p', value)); a.lastChild.className = 'big'; if (note) a.append(element('small', note)); return a; }
++async function analytics(month) {
++  const d = await api('analytics' + (month ? '?month=' + encodeURIComponent(month) : ''));
++  const a = d.analytics, rows = a.rows;
++  const select = $('analytics-month'), months = a.months.includes(a.month) ? a.months : [a.month].concat(a.months);
++  select.replaceChildren(...months.map(m => { const o = element('option', m); o.value = m; return o; })); select.value = a.month;
++  const all = group(rows, () => 'all')[0]?.[1] || {requests: 0, total: 0, cost: 0};
++  const now = new Date(), current = a.month === now.toISOString().slice(0, 7);
++  const cards = [card('API cost', usdText(all.cost), 'At Anthropic list prices'), card('Tokens', tokensText(all.total), fmtInt.format(all.requests) + ' requests')];
++  if (current) {
++    const start = Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1), end = Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1);
++    const fraction = Math.max((now - start) / (end - start), 1 / 31);
++    cards.push(card('Projected month', usdText(all.cost / fraction), 'If usage continues at this month\'s pace'));
++  }
++  $('analytics-totals').replaceChildren(...cards);
++  const keyLabel = id => a.keys[id] || (id ? 'Unknown key ' + id.slice(0, 6) : 'No key');
++  table('analytics-keys', groupHeaders('API key'), group(rows, r => r.key_id).map(([id, g]) => groupRow(keyLabel(id), g)));
++  table('analytics-models', groupHeaders('Model'), group(rows, r => r.model).map(([m, g]) => groupRow(m, g)));
++  table('analytics-accounts', groupHeaders('Account'), group(rows, r => r.auth_index).map(([idx, g]) => groupRow(d.accounts[idx] || (idx ? 'Removed account' : 'Unknown'), g)));
++  $('pricing-source').textContent = a.pricing_source;
++  table('analytics-pricing', ['Model', 'ID prefix', 'Input', 'Cache write 5m', 'Cache write 1h', 'Cache read', 'Output'],
++    a.pricing.map(p => [p.name + (p.legacy ? ' (legacy)' : '') + (p.long_prompt ? ' (≤' + fmtInt.format(p.long_prompt_threshold) + ' prompt; above: $' + p.long_prompt.input + ' / $' + p.long_prompt.output + ')' : '') + (p.fast_mode ? ' · fast mode 2×' : ''), p.model, '$' + p.input, '$' + p.cache_write_5m, '$' + p.cache_write_1h, '$' + p.cache_read, '$' + p.output]));
++}
++$('analytics-month').addEventListener('change', action(() => analytics($('analytics-month').value)));
++
++// ---- Navigation hooks ----
++const pageLoaders = {dashboard: usageOverview, keys: keysPage, analytics: () => analytics('')};
++document.querySelectorAll('nav [data-page]').forEach(b => b.addEventListener('click', action(async () => { const load = pageLoaders[b.dataset.page]; if (load) await load(); })));
++document.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => document.querySelector('nav [data-page="' + b.dataset.goto + '"]').click()));
++const baseSignedIn = signedIn;
++signedIn = async function () { await baseSignedIn(); try { await usageOverview(); } catch (e) { message(e.message); } };
++resetKeyForm(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly');
