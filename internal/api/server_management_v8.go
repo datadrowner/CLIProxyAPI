@@ -4,6 +4,7 @@ import (
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/access/keylimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api/handlers/management"
 )
 
@@ -40,6 +41,9 @@ func (s *Server) registerManagementV8Routes() {
 	v8.GET("/observability/logs/errors/:name", s.mgmt.DownloadRequestErrorLog)
 	v8.GET("/observability/logs/requests/:id", s.mgmt.GetRequestLogByID)
 	v8.GET("/observability/usage/api-keys", s.mgmt.GetAPIKeyUsage)
+	v8.GET("/observability/usage/api-key-limits", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"keys": keylimit.Default().Snapshot()})
+	})
 	v8.GET("/observability/usage/queue", s.mgmt.GetUsageQueue)
 
 	v8.GET("/credentials", s.mgmt.ListAuthFiles)

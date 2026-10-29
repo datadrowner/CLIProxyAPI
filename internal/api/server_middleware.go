@@ -522,6 +522,9 @@ func accessAuthMiddleware(manager *sdkaccess.Manager, realtimeError bool) gin.Ha
 				reqCtx = coreusage.WithAccessProvider(reqCtx, result.Provider)
 				reqCtx = coreusage.WithIsNativeKey(reqCtx, coreusage.IsNativeAccessProvider(result.Provider))
 				c.Request = c.Request.WithContext(reqCtx)
+				if !enforceAPIKeyLimit(c, result.Principal) {
+					return
+				}
 			}
 			middleware.CaptureAuthenticatedRequestBody(c)
 			if c.IsAborted() {
@@ -590,6 +593,9 @@ func realtimeAuthMiddleware(manager *sdkaccess.Manager, handler *codexlive.Handl
 		reqCtx = coreusage.WithAccessProvider(reqCtx, provider)
 		reqCtx = coreusage.WithIsNativeKey(reqCtx, coreusage.IsNativeAccessProvider(provider))
 		c.Request = c.Request.WithContext(reqCtx)
+		if !enforceAPIKeyLimit(c, principal) {
+			return
+		}
 		c.Set(codexlive.ClientSecretSessionContextKey, authorization.Session)
 		c.Set(codexlive.ClientSecretPrincipalContextKey, authorization.Principal)
 		middleware.CaptureAuthenticatedRequestBody(c)

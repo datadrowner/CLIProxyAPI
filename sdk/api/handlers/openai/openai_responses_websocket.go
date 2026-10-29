@@ -18,6 +18,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/access/keylimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	"github.com/router-for-me/CLIProxyAPI/v8/sdk/api/handlers"
@@ -322,6 +323,16 @@ func (h *OpenAIResponsesAPIHandler) authenticateResponsesWebsocketTurn(c *gin.Co
 	}
 	if result == nil {
 		return "", nil
+	}
+	if _, _, limitErr := keylimit.Default().Check(result.Principal); limitErr != nil {
+		statusCode := http.StatusTooManyRequests
+		if limitErr.Code == "api_key_limit_misconfigured" {
+			statusCode = http.StatusForbidden
+		}
+		return "", &interfaces.ErrorMessage{
+			StatusCode: statusCode,
+			Error:      errors.New(limitErr.Message),
+		}
 	}
 	if c != nil && updateRequestContext {
 		c.Set("userApiKey", result.Principal)

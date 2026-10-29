@@ -19,6 +19,7 @@ import (
 
 	"github.com/joho/godotenv"
 	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/access/keylimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/cmd"
@@ -682,6 +683,7 @@ func main() {
 
 	// Register built-in access providers before constructing services.
 	configaccess.Register(&cfg.SDKConfig)
+	keylimit.Default().Configure(cfg)
 	pluginHost.ApplyConfig(context.Background(), cfg)
 	if configLoadedFromHome && homePluginStatusReady {
 		errHomePluginLoad := homeplugins.MarkLoadResults(&homePluginSyncReport, pluginHost)

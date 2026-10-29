@@ -97,6 +97,7 @@ retain the corresponding business operation's fields.
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
 | `/observability/logs/requests/<id>` | GET | Get a request log. |
 | `/observability/usage/api-keys` | GET | Get API-key usage. |
+| `/observability/usage/api-key-limits` | GET | Get token budgets and consumption of client keys configured under `access.api-key-limits` (keys are masked). |
 | `/observability/usage/queue` | GET | Get queued usage events. |
 | `/credentials` | GET, POST, DELETE | List, upload, or delete credential files. |
 | `/credentials/models` | GET | Get credential models. |

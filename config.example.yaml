@@ -123,6 +123,35 @@ access:
     - "your-api-key-2"
     - "your-api-key-3"
 
+  # Optional client keys with individual token budgets. Keys listed here are accepted
+  # for authentication in addition to api-keys above (no need to list them twice).
+  # A key with neither token-limit nor subscription has full (unlimited) usage.
+  # Exhausted keys get HTTP 429 until their period resets. Budgets are checked before
+  # each request, so the request that crosses the limit may overshoot it.
+  # Clients can check their own budget with GET /v1/api-key/usage.
+  # api-key-limits:
+  #   # Where consumed token counters are persisted (default: <auth-dir>/api-key-usage.json).
+  #   state-file: ""
+  #   # Named plans that keys can reference. period: total (never resets, default),
+  #   # daily, weekly, monthly (calendar periods in UTC), or a duration such as "5h".
+  #   subscriptions:
+  #     - name: "starter"
+  #       token-limit: 1000000
+  #       period: "monthly"
+  #     - name: "pro"
+  #       token-limit: 2000000
+  #       period: "daily"
+  #   keys:
+  #     - key: "full-usage-key"            # unlimited
+  #       name: "admin"
+  #     - key: "fixed-budget-key"          # one-off budget of 500k tokens
+  #       token-limit: 500000
+  #     - key: "pro-subscriber-key"        # limits come from the "pro" subscription
+  #       subscription: "pro"
+  #     - key: "pro-plus-key"              # "pro" period with a larger budget
+  #       subscription: "pro"
+  #       token-limit: 5000000
+
 # Optional credential concurrency and observation contracts.
 
 # credentials:

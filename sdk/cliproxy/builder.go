@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v8/internal/access/config_access"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/access/keylimit"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher"
@@ -237,6 +238,7 @@ func (b *Builder) Build() (*Service, error) {
 	}
 
 	configaccess.Register(&b.cfg.SDKConfig)
+	keylimit.Default().Configure(b.cfg)
 	pluginHost := b.pluginHost
 	if pluginHost == nil {
 		pluginHost = pluginhost.New()
