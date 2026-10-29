@@ -1,3 +1,150 @@
+diff --git a/internal/cliproxy/claude_usage.go b/internal/cliproxy/claude_usage.go
+new file mode 100644
+index 0000000..608f1f2
+--- /dev/null
++++ b/internal/cliproxy/claude_usage.go
+@@ -0,0 +1,111 @@
++package cliproxy
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"math"
++	"sort"
++	"strings"
++	"time"
++)
++
++// claudeUsageURL is the endpoint Claude Code's /usage reads for subscription
++// accounts. It is not a documented public API, so responses are parsed defensively.
++const claudeUsageURL = "https://api.anthropic.com/api/oauth/usage"
++
++var claudeWindowLabels = map[string]string{
++	"five_hour":            "5-hour limit",
++	"seven_day":            "Weekly limit",
++	"seven_day_sonnet":     "Weekly limit (Sonnet)",
++	"seven_day_opus":       "Weekly limit (Opus)",
++	"seven_day_oauth_apps": "Weekly limit (OAuth apps)",
++}
++
++var claudeWindowOrder = map[string]int{"five_hour": 0, "seven_day": 1}
++
++// ClaudeUsage asks upstream to read a Claude account's plan usage with that
++// account's own OAuth token; the token is substituted server-side and never
++// reaches this process.
++func (c *Client) ClaudeUsage(ctx context.Context, authIndex string) ([]QuotaWindow, error) {
++	if strings.TrimSpace(authIndex) == "" {
++		return nil, errors.New("account has no auth index")
++	}
++	req := map[string]any{
++		"auth_index": authIndex,
++		"method":     "GET",
++		"url":        claudeUsageURL,
++		"header": map[string]string{
++			"Authorization":  "Bearer $TOKEN$",
++			"anthropic-beta": "oauth-2025-04-20",
++			"Accept":         "application/json",
++		},
++	}
++	var out struct {
++		StatusCode int    `json:"status_code"`
++		Body       string `json:"body"`
++	}
++	if e := c.Do(ctx, "POST", "/v8/management/requests/api-call", req, &out); e != nil {
++		return nil, e
++	}
++	if out.StatusCode != 200 {
++		return nil, errors.New("Anthropic usage request failed")
++	}
++	return parseClaudeUsage([]byte(out.Body))
++}
++
++// parseClaudeUsage reads every top-level object that has a numeric
++// "utilization" (percent) and an optional "resets_at" (RFC 3339).
++func parseClaudeUsage(body []byte) ([]QuotaWindow, error) {
++	var raw map[string]json.RawMessage
++	if e := json.Unmarshal(body, &raw); e != nil {
++		return nil, errors.New("invalid Anthropic usage response")
++	}
++	type keyed struct {
++		key string
++		w   QuotaWindow
++	}
++	found := []keyed{}
++	for key, value := range raw {
++		var window struct {
++			Utilization *float64 `json:"utilization"`
++			ResetsAt    *string  `json:"resets_at"`
++		}
++		if json.Unmarshal(value, &window) != nil || window.Utilization == nil || math.IsNaN(*window.Utilization) {
++			continue
++		}
++		label := claudeWindowLabels[key]
++		if label == "" {
++			if len(key) > 40 {
++				continue
++			}
++			label = strings.ReplaceAll(key, "_", " ")
++		}
++		w := QuotaWindow{Label: label, UsedPercent: clampPercent(*window.Utilization)}
++		if window.ResetsAt != nil {
++			if t, e := time.Parse(time.RFC3339, *window.ResetsAt); e == nil {
++				w.ResetsAt = t.UTC()
++			}
++		}
++		found = append(found, keyed{key, w})
++	}
++	if len(found) == 0 {
++		return nil, errors.New("Anthropic usage response has no limit windows")
++	}
++	sort.Slice(found, func(i, j int) bool {
++		oi, okI := claudeWindowOrder[found[i].key]
++		oj, okJ := claudeWindowOrder[found[j].key]
++		switch {
++		case okI && okJ:
++			return oi < oj
++		case okI != okJ:
++			return okI
++		}
++		return found[i].key < found[j].key
++	})
++	windows := make([]QuotaWindow, len(found))
++	for i, f := range found {
++		windows[i] = f.w
++	}
++	return windows, nil
++}
+diff --git a/internal/cliproxy/claude_usage_test.go b/internal/cliproxy/claude_usage_test.go
+new file mode 100644
+index 0000000..b0baa9c
+--- /dev/null
++++ b/internal/cliproxy/claude_usage_test.go
+@@ -0,0 +1,24 @@
++package cliproxy
++
++import (
++	"testing"
++	"time"
++)
++
++func TestParseClaudeUsage(t *testing.T) {
++	got, e := parseClaudeUsage([]byte(`{"seven_day_sonnet":{"utilization":4,"resets_at":null},"seven_day":{"utilization":61.25,"resets_at":"2030-01-05T00:00:00+00:00"},"five_hour":{"utilization":23.5,"resets_at":"2030-01-01T05:00:00Z"},"seven_day_opus":null,"extra_usage":{"is_enabled":false},"overflow":{"utilization":250}}`))
++	if e != nil {
++		t.Fatal(e)
++	}
++	if len(got) != 4 || got[0].Label != "5-hour limit" || got[1].Label != "Weekly limit" || got[2].Label != "overflow" || got[3].Label != "Weekly limit (Sonnet)" {
++		t.Fatalf("windows = %+v", got)
++	}
++	if got[0].UsedPercent != 23.5 || !got[0].ResetsAt.Equal(time.Date(2030, 1, 1, 5, 0, 0, 0, time.UTC)) || got[1].UsedPercent != 61.3 || got[2].UsedPercent != 100 || !got[3].ResetsAt.IsZero() {
++		t.Fatalf("values = %+v", got)
++	}
++	for _, body := range []string{`not json`, `{}`, `{"five_hour":null}`} {
++		if _, e := parseClaudeUsage([]byte(body)); e == nil {
++			t.Fatalf("accepted %s", body)
++		}
++	}
++}
 diff --git a/internal/cliproxy/client.go b/internal/cliproxy/client.go
 index b4bc63b..d2e46b0 100644
 --- a/internal/cliproxy/client.go
@@ -407,7 +554,7 @@ index 0000000..95a1abf
 +	}
 +}
 diff --git a/internal/mock/mock.go b/internal/mock/mock.go
-index db0af38..b3f44cf 100644
+index db0af38..3eba8ac 100644
 --- a/internal/mock/mock.go
 +++ b/internal/mock/mock.go
 @@ -2,7 +2,10 @@
@@ -421,12 +568,16 @@ index db0af38..b3f44cf 100644
  	"net/http"
  	"net/url"
  	"os"
-@@ -15,6 +18,13 @@ type Server struct {
+@@ -15,6 +18,17 @@ type Server struct {
  	mu                          sync.Mutex
  	Secret, Key, Config, Status string
  	Connected, Disabled         bool
 +	// Limits stores access.api-key-limits as JSON; nil means the section is absent.
 +	Limits []byte
++	// Claude adds a Claude OAuth account; ClaudeUsageStatus overrides the usage endpoint status.
++	Claude            bool
++	ClaudeUsageStatus int
++	ClaudeUsageCalls  int
 +}
 +
 +func keyID(key string) string {
@@ -435,17 +586,20 @@ index db0af38..b3f44cf 100644
  }
  
  func New() *Server {
-@@ -96,7 +106,8 @@ func (s *Server) Handler() http.Handler {
+@@ -96,7 +110,11 @@ func (s *Server) Handler() http.Handler {
  			}
  			files := []any{}
  			if s.Connected {
 -				files = append(files, map[string]any{"name": "mock.json", "provider": "codex", "email": "demo@example.invalid", "disabled": s.Disabled, "status": "active", "refresh_token": "MUST-NOT-LEAK", "id_token": map[string]string{"plan_type": "plus"}})
 +				files = append(files, map[string]any{"name": "mock.json", "provider": "codex", "email": "demo@example.invalid", "disabled": s.Disabled, "status": "active", "refresh_token": "MUST-NOT-LEAK", "id_token": map[string]string{"plan_type": "plus"}, "auth_index": "mock-index",
 +					"quota": map[string]any{"signals": map[string]string{"X-Codex-Primary-Used-Percent": "42", "X-Codex-Primary-Window-Minutes": "300", "X-Codex-Primary-Reset-At": "1893456000", "X-Codex-Plan-Type": "MUST-NOT-LEAK-EITHER"}}})
++			}
++			if s.Claude {
++				files = append(files, map[string]any{"name": "claude.json", "provider": "claude", "email": "me@example.invalid", "status": "active", "auth_index": "claude-index", "access_token": "MUST-NOT-LEAK"})
  			}
  			send(map[string]any{"files": files})
  		case "/v8/management/credentials/models":
-@@ -108,6 +119,49 @@ func (s *Server) Handler() http.Handler {
+@@ -108,6 +126,66 @@ func (s *Server) Handler() http.Handler {
  			send(map[string]bool{"ok": true})
  		case "/v8/management/observability/logs":
  			send(map[string]any{"lines": []string{"INFO mock started", "ERROR Authorization: Bearer MUST-NOT-LEAK"}})
@@ -485,6 +639,23 @@ index db0af38..b3f44cf 100644
 +				usage = append(usage, entry)
 +			}
 +			send(map[string]any{"keys": usage})
++		case "/v8/management/requests/api-call":
++			var v struct {
++				AuthIndex string            `json:"auth_index"`
++				URL       string            `json:"url"`
++				Header    map[string]string `json:"header"`
++			}
++			_ = json.NewDecoder(r.Body).Decode(&v)
++			if v.AuthIndex != "claude-index" || v.URL != "https://api.anthropic.com/api/oauth/usage" || v.Header["Authorization"] != "Bearer $TOKEN$" {
++				w.WriteHeader(400)
++				return
++			}
++			s.ClaudeUsageCalls++
++			status := 200
++			if s.ClaudeUsageStatus != 0 {
++				status = s.ClaudeUsageStatus
++			}
++			send(map[string]any{"status_code": status, "body": `{"five_hour":{"utilization":23.5,"resets_at":"2030-01-01T05:00:00Z"},"seven_day":{"utilization":61,"resets_at":"2030-01-05T00:00:00Z"},"seven_day_opus":null,"extra_usage":{"is_enabled":false}}`})
 +		case "/v8/management/observability/usage/analytics":
 +			send(map[string]any{
 +				"month": "2026-10", "months": []string{"2026-10"},
@@ -628,10 +799,10 @@ index 4b43ec5..900f2db 100644
 +}
 diff --git a/internal/web/limits.go b/internal/web/limits.go
 new file mode 100644
-index 0000000..5370b5e
+index 0000000..0fe36fb
 --- /dev/null
 +++ b/internal/web/limits.go
-@@ -0,0 +1,375 @@
+@@ -0,0 +1,440 @@
 +package web
 +
 +import (
@@ -639,6 +810,7 @@ index 0000000..5370b5e
 +	"net/http"
 +	"regexp"
 +	"strings"
++	"sync"
 +	"time"
 +	"unicode"
 +
@@ -992,11 +1164,26 @@ index 0000000..5370b5e
 +		Status   string                 `json:"status"`
 +		Disabled bool                   `json:"disabled"`
 +		Limits   []cliproxy.QuotaWindow `json:"limits"`
-+		Month    totals                 `json:"month"`
++		// LimitsSource is "live" (fetched from the provider) or "observed" (from response headers).
++		LimitsSource string    `json:"limits_source"`
++		LimitsAt     time.Time `json:"limits_at,omitempty"`
++		LimitsNote   string    `json:"limits_note,omitempty"`
++		Month        totals    `json:"month"`
 +	}
++	live := s.planUsage(ctx, accounts, r.URL.Query().Get("refresh") == "1")
 +	rows := []accountRow{}
 +	for _, acc := range accounts {
 +		row := accountRow{ID: acc.ID, Label: accountLabel(acc), Plan: acc.Plan, Status: acc.Status, Disabled: acc.Disabled, Limits: acc.Limits}
++		if len(row.Limits) > 0 {
++			row.LimitsSource = "observed"
++		}
++		if u, ok := live[acc.Index]; ok {
++			if u.err == "" {
++				row.Limits, row.LimitsSource, row.LimitsAt = u.windows, "live", u.at
++			} else {
++				row.LimitsNote = u.err
++			}
++		}
 +		if row.Limits == nil {
 +			row.Limits = []cliproxy.QuotaWindow{}
 +		}
@@ -1007,12 +1194,61 @@ index 0000000..5370b5e
 +	}
 +	reply(w, 200, map[string]any{"month": a.Month, "keys": keys, "accounts": rows})
 +}
++
++// planUsageTTL bounds how often each account's plan usage is fetched from the provider.
++const planUsageTTL = 60 * time.Second
++
++type cachedUsage struct {
++	at      time.Time
++	windows []cliproxy.QuotaWindow
++	err     string
++}
++
++// planUsage fetches live plan usage (5-hour and weekly windows) for enabled
++// Claude accounts in parallel, caching results and failures for planUsageTTL.
++func (s *Server) planUsage(ctx context.Context, accounts []cliproxy.Account, force bool) map[string]cachedUsage {
++	out := map[string]cachedUsage{}
++	var mu sync.Mutex
++	var wg sync.WaitGroup
++	for _, acc := range accounts {
++		if !strings.EqualFold(acc.Provider, "claude") || acc.Disabled || acc.Index == "" {
++			continue
++		}
++		s.usageMu.Lock()
++		cached, ok := s.usageCache[acc.Index]
++		s.usageMu.Unlock()
++		if ok && !force && time.Since(cached.at) < planUsageTTL {
++			out[acc.Index] = cached
++			continue
++		}
++		wg.Add(1)
++		go func(index string) {
++			defer wg.Done()
++			windows, e := s.Client.ClaudeUsage(ctx, index)
++			result := cachedUsage{at: time.Now().UTC(), windows: windows}
++			if e != nil {
++				result.err = "Plan usage could not be loaded from Anthropic right now; showing the last observed values if any."
++			}
++			s.usageMu.Lock()
++			if s.usageCache == nil {
++				s.usageCache = map[string]cachedUsage{}
++			}
++			s.usageCache[index] = result
++			s.usageMu.Unlock()
++			mu.Lock()
++			out[index] = result
++			mu.Unlock()
++		}(acc.Index)
++	}
++	wg.Wait()
++	return out
++}
 diff --git a/internal/web/limits_test.go b/internal/web/limits_test.go
 new file mode 100644
-index 0000000..5b3ce7c
+index 0000000..aaaa4a0
 --- /dev/null
 +++ b/internal/web/limits_test.go
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,236 @@
 +package web
 +
 +import (
@@ -1213,8 +1449,44 @@ index 0000000..5b3ce7c
 +		t.Fatalf("saved = %+v", saved.Keys[0])
 +	}
 +}
++
++func TestLiveClaudePlanUsage(t *testing.T) {
++	m, do := limitsFixture(t)
++	m.Claude = true
++	var overview struct {
++		Accounts []struct {
++			Label        string                 `json:"label"`
++			Limits       []cliproxy.QuotaWindow `json:"limits"`
++			LimitsSource string                 `json:"limits_source"`
++			LimitsNote   string                 `json:"limits_note"`
++		} `json:"accounts"`
++	}
++	w := do("GET", "/api/usage", "")
++	decodeBody(t, w, &overview)
++	if strings.Contains(w.Body.String(), "MUST-NOT-LEAK") || strings.Contains(w.Body.String(), "claude-index") {
++		t.Fatal("overview leaks credentials or auth index")
++	}
++	claude := overview.Accounts[1]
++	if claude.Label != "claude · me@example.invalid" || claude.LimitsSource != "live" || len(claude.Limits) != 2 ||
++		claude.Limits[0].Label != "5-hour limit" || claude.Limits[0].UsedPercent != 23.5 || claude.Limits[1].Label != "Weekly limit" || claude.Limits[1].UsedPercent != 61 {
++		t.Fatalf("claude account = %+v", claude)
++	}
++	if overview.Accounts[0].LimitsSource != "observed" {
++		t.Fatalf("codex account = %+v", overview.Accounts[0])
++	}
++
++	do("GET", "/api/usage", "")
++	if m.ClaudeUsageCalls != 1 {
++		t.Fatalf("usage fetched %d times, want cached", m.ClaudeUsageCalls)
++	}
++	m.ClaudeUsageStatus = 401
++	decodeBody(t, do("GET", "/api/usage?refresh=1", ""), &overview)
++	if m.ClaudeUsageCalls != 2 || overview.Accounts[1].LimitsNote == "" || len(overview.Accounts[1].Limits) != 0 {
++		t.Fatalf("failed refresh: calls=%d account=%+v", m.ClaudeUsageCalls, overview.Accounts[1])
++	}
++}
 diff --git a/internal/web/server.go b/internal/web/server.go
-index dc2ec30..fa32d99 100644
+index dc2ec30..45e0a57 100644
 --- a/internal/web/server.go
 +++ b/internal/web/server.go
 @@ -6,6 +6,7 @@ import (
@@ -1225,16 +1497,19 @@ index dc2ec30..fa32d99 100644
  	"sync/atomic"
  	"time"
  
-@@ -22,6 +23,8 @@ type Server struct {
+@@ -22,6 +23,11 @@ type Server struct {
  	Alive     atomic.Bool
  	APIPort   int
  	Started   time.Time
 +	// limitsMu serializes read-modify-write of access.api-key-limits.
 +	limitsMu sync.Mutex
++	// usageMu guards usageCache, the per-account plan usage cache.
++	usageMu    sync.Mutex
++	usageCache map[string]cachedUsage
  }
  
  func New(c *cliproxy.Client, a *security.Auth) *Server {
-@@ -215,8 +218,25 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
+@@ -215,8 +221,25 @@ func (s *Server) api(w http.ResponseWriter, r *http.Request) {
  			return
  		}
  		reply(w, 200, logs)
@@ -1358,7 +1633,7 @@ index d664300..59f5f3a 100644
  document.querySelectorAll('.copy-url').forEach(b => b.addEventListener('click', action(() => copy(baseURL))));
  document.querySelectorAll('.copy-key').forEach(b => b.addEventListener('click', action(async () => { const d = await api('key'); await copy(d.key); })));
 diff --git a/web/static/index.html b/web/static/index.html
-index d6488c6..c1327b1 100644
+index d6488c6..f564070 100644
 --- a/web/static/index.html
 +++ b/web/static/index.html
 @@ -1,11 +1,11 @@
@@ -1372,7 +1647,7 @@ index d6488c6..c1327b1 100644
 -<section id="dashboard" class="page"><p class="eyebrow">YOUR GATEWAY</p><h1>Ready when you are.</h1><div class="grid"><article><h2>CLIProxyAPI</h2><p id="status">Starting</p><small id="version"></small></article><article><h2>Proxy endpoint</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button></article></div><article><h2>Available models</h2><p>Models appear after you connect a provider.</p><button id="test">Test API</button><button id="refresh-models">Refresh Models</button><ul id="models"></ul></article><article><h2>Provider accounts</h2><ul id="overview-accounts"></ul></article><article><h2>Client API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button></article></section>
 -<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
 +<div id="app" hidden><nav aria-label="Pages"><button data-page="dashboard" class="selected">Overview</button><button data-page="providers">Providers</button><button data-page="access">API Access</button><button data-page="keys">API Keys</button><button data-page="analytics">Analytics</button><button data-page="logs">Logs</button></nav>
-+<section id="dashboard" class="page"><p class="eyebrow">YOUR GATEWAY</p><h1>Ready when you are.</h1><div class="grid"><article><h2>CLIProxyAPI</h2><p id="status">Starting</p><small id="version"></small></article><article><h2>Proxy endpoint</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button></article></div><article><h2>Available models</h2><p>Models appear after you connect a provider.</p><button id="test">Test API</button><button id="refresh-models">Refresh Models</button><ul id="models"></ul></article><article><h2>API key usage</h2><p>Token budgets of your keys and what each key used this month (<span id="usage-month"></span>). Cost is the Anthropic API list-price equivalent.</p><div id="usage-keys" class="usage-list"></div><button data-goto="keys">Manage API keys</button></article><article><h2>Connected accounts</h2><p>Subscription limits reported by each provider (refreshed whenever the account serves a request) and this month's usage through this proxy.</p><div id="usage-accounts" class="usage-list"></div></article><article><h2>Client API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button></article></section>
++<section id="dashboard" class="page"><p class="eyebrow">YOUR GATEWAY</p><h1>Ready when you are.</h1><div class="grid"><article><h2>CLIProxyAPI</h2><p id="status">Starting</p><small id="version"></small></article><article><h2>Proxy endpoint</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button></article></div><article><h2>Available models</h2><p>Models appear after you connect a provider.</p><button id="test">Test API</button><button id="refresh-models">Refresh Models</button><ul id="models"></ul></article><article><h2>Plan usage per connected account</h2><p>The 5-hour and weekly limits of each subscription account, as Claude's /usage shows them, plus this month's usage through this proxy. Claude accounts are read live from Anthropic (at most once a minute); other providers show the limits reported with their last response.</p><div id="usage-accounts" class="usage-list"></div><button id="refresh-usage">Refresh usage</button></article><article><h2>API key usage</h2><p>Token budgets of your keys and what each key used this month (<span id="usage-month"></span>). Cost is the Anthropic API list-price equivalent.</p><div id="usage-keys" class="usage-list"></div><button data-goto="keys">Manage API keys</button></article><article><h2>Client API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button></article></section>
 +<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><article id="paste-callback"><h2>Paste a callback URL</h2><p>Signed in on another computer and the browser ended on a localhost page that could not load? Click Connect first, sign in, then copy the complete URL from the browser address bar and paste it here. This works even after reloading this page, within 5 minutes of clicking Connect.</p><form id="paste-callback-form"><label for="paste-callback-url">Callback URL</label><input id="paste-callback-url" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:54545/callback?code=…&amp;state=…"><button type="submit">Submit callback URL</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
  <section id="access" class="page" hidden><p class="eyebrow">PLUG INTO YOUR TOOLS</p><h1>API Access.</h1><article><h2>Base URL</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button><h2>API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button><p>Use this URL and key in an OpenAI-compatible client. Choose a model shown on Overview.</p><hr><p>Existing clients using this key will stop working after key regeneration.</p><button id="rotate" class="danger">Regenerate API Key</button></article></section>
 -<section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
@@ -1404,10 +1679,10 @@ index 614cbbf..ec90a50 100644
 +.field-hint{font-size:13px;color:#8fa0b3;margin:6px 0 0}
 diff --git a/web/static/usage.js b/web/static/usage.js
 new file mode 100644
-index 0000000..f89d3d1
+index 0000000..372cfc1
 --- /dev/null
 +++ b/web/static/usage.js
-@@ -0,0 +1,200 @@
+@@ -0,0 +1,204 @@
 +'use strict';
 +// API keys, usage overview and analytics. Uses helpers from app.js.
 +const fmtInt = new Intl.NumberFormat();
@@ -1452,8 +1727,8 @@ index 0000000..f89d3d1
 +}
 +
 +// ---- Overview ----
-+async function usageOverview() {
-+  const d = await api('usage');
++async function usageOverview(refresh) {
++  const d = await api('usage' + (refresh ? '?refresh=1' : ''));
 +  $('usage-month').textContent = d.month;
 +  $('usage-keys').replaceChildren(...d.keys.map(k => {
 +    const row = element('div', ''); row.className = 'usage-row';
@@ -1472,12 +1747,15 @@ index 0000000..f89d3d1
 +    const head = element('div', ''); head.className = 'usage-head';
 +    head.append(element('strong', a.label + (a.plan ? ' · ' + a.plan : '')), element('span', a.disabled ? 'Disabled' : a.status));
 +    row.append(head);
-+    if (!a.limits.length) row.append(element('small', 'No subscription limit reported yet; it appears after this account serves a request.'));
++    if (a.limits_note) row.append(element('small', a.limits_note));
++    if (!a.limits.length && !a.limits_note) row.append(element('small', 'No plan limits reported yet; they appear after this account serves a request.'));
 +    a.limits.forEach(l => {
 +      const line = element('div', ''); line.className = 'usage-head';
-+      line.append(element('span', l.label), element('span', l.used_percent + '% used' + (whenText(l.resets_at) ? ' · resets ' + whenText(l.resets_at) : '')));
++      line.append(element('span', l.label), element('span', shareText(l.used_percent) + ' used' + (whenText(l.resets_at) ? ' · resets ' + whenText(l.resets_at) : '')));
 +      row.append(line, meter(l.used_percent, 100, a.label + ' ' + l.label));
 +    });
++    if (a.limits_source === 'live' && whenText(a.limits_at)) row.append(element('small', 'Live from Anthropic · checked ' + whenText(a.limits_at)));
++    if (a.limits_source === 'observed') row.append(element('small', 'From the last response this account served.'));
 +    row.append(element('small', 'This month: ' + tokensText(a.month.tokens) + ' tokens · ' + fmtInt.format(a.month.requests) + ' requests · ' + usdText(a.month.cost_usd)));
 +    return row;
 +  }));
@@ -1599,6 +1877,7 @@ index 0000000..f89d3d1
 +  table('analytics-pricing', ['Model', 'ID prefix', 'Input', 'Cache write 5m', 'Cache write 1h', 'Cache read', 'Output'],
 +    a.pricing.map(p => [p.name + (p.legacy ? ' (legacy)' : '') + (p.long_prompt ? ' (≤' + fmtInt.format(p.long_prompt_threshold) + ' prompt; above: $' + p.long_prompt.input + ' / $' + p.long_prompt.output + ')' : '') + (p.fast_mode ? ' · fast mode 2×' : ''), p.model, '$' + p.input, '$' + p.cache_write_5m, '$' + p.cache_write_1h, '$' + p.cache_read, '$' + p.output]));
 +}
++$('refresh-usage').addEventListener('click', action(async () => { await usageOverview(true); message('Usage refreshed.'); }));
 +$('analytics-month').addEventListener('change', action(() => analytics($('analytics-month').value)));
 +
 +// ---- Navigation hooks ----
