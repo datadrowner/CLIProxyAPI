@@ -1679,16 +1679,18 @@ index 614cbbf..ec90a50 100644
 +.field-hint{font-size:13px;color:#8fa0b3;margin:6px 0 0}
 diff --git a/web/static/usage.js b/web/static/usage.js
 new file mode 100644
-index 0000000..372cfc1
+index 0000000..8a4ff04
 --- /dev/null
 +++ b/web/static/usage.js
-@@ -0,0 +1,204 @@
+@@ -0,0 +1,213 @@
 +'use strict';
 +// API keys, usage overview and analytics. Uses helpers from app.js.
 +const fmtInt = new Intl.NumberFormat();
 +const fmtUSD = new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumFractionDigits: 2});
++// Small amounts keep up to 3 significant digits so a few cents or less never shows as 0.
++const fmtUSDSmall = new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD', minimumFractionDigits: 2, maximumSignificantDigits: 3});
 +const tokensText = n => fmtInt.format(n || 0);
-+const usdText = n => fmtUSD.format(n || 0);
++const usdText = n => (n > 0 && n < 1 ? fmtUSDSmall : fmtUSD).format(n || 0);
 +const periodText = p => ({'': 'never resets', total: 'never resets', daily: 'per day', weekly: 'per week', monthly: 'per month'})[p || ''] || 'per ' + p;
 +const whenText = t => { if (!t || t.startsWith('0001')) return ''; const d = new Date(t); return isNaN(d) ? '' : d.toLocaleString(); };
 +let plans = [], keyRows = [];
@@ -1885,5 +1887,12 @@ index 0000000..372cfc1
 +document.querySelectorAll('nav [data-page]').forEach(b => b.addEventListener('click', action(async () => { const load = pageLoaders[b.dataset.page]; if (load) await load(); })));
 +document.querySelectorAll('[data-goto]').forEach(b => b.addEventListener('click', () => document.querySelector('nav [data-page="' + b.dataset.goto + '"]').click()));
 +const baseSignedIn = signedIn;
-+signedIn = async function () { await baseSignedIn(); try { await usageOverview(); } catch (e) { message(e.message); } };
++// Remember the selected page in the URL (#keys, #analytics, ...) so a reload returns to it.
++document.querySelectorAll('nav [data-page]').forEach(b => b.addEventListener('click', () => history.replaceState(null, '', '#' + b.dataset.page)));
++signedIn = async function () {
++  await baseSignedIn();
++  const page = location.hash.slice(1), target = page && document.querySelector('nav [data-page="' + CSS.escape(page) + '"]');
++  if (target && page !== 'dashboard') { target.click(); return; }
++  try { await usageOverview(); } catch (e) { message(e.message); }
++};
 +resetKeyForm(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly');
