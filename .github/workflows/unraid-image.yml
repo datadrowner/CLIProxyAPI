@@ -1,8 +1,8 @@
 name: unraid-image
 
 # Builds this fork into a CLIProxyAPI image, then layers the OzoneH3 Unraid
-# wrapper (WebUI on 8318, WEBUI_PASSWORD, /data appdata) on top of it, and
-# publishes both to GHCR:
+# wrapper (WebUI on 8318, WEBUI_PASSWORD, /data appdata) on top of it, with
+# .github/unraid/*.patch applied, and publishes both to GHCR:
 #   ghcr.io/<owner>/cliproxyapi:latest         plain CLIProxyAPI from this fork
 #   ghcr.io/<owner>/cliproxyapi-unraid:latest  drop-in for ghcr.io/ozoneh3/cliproxyapi-unraid
 
@@ -77,6 +77,13 @@ jobs:
           repository: ${{ env.WRAPPER_REPOSITORY }}
           ref: ${{ env.WRAPPER_REF }}
           path: unraid-wrapper
+      - name: Patch and test Unraid wrapper
+        working-directory: unraid-wrapper
+        run: |
+          # Lets Connect replace a stuck login and accepts a pasted callback URL
+          # matched by OAuth state, for sign-ins finished on another computer.
+          git apply --verbose ../.github/unraid/wrapper-oauth-callback.patch
+          go test -race ./...
       - name: Build and push Unraid image
         uses: docker/build-push-action@v6
         with:
