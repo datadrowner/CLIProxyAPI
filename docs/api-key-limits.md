@@ -52,6 +52,30 @@ keys:
 
 How a key's portion is estimated: the provider only reports the account's total utilization, so the proxy records the API-equivalent cost (tokens for unpriced models) every key sends through each account, in 5-minute buckets. A key's portion of a window is `window utilization × key cost / total cost through that account since the window started`. Usage of the account outside this proxy (for example claude.ai) is therefore split across the keys in proportion to their use, which errs on the side of limiting early. A key is rejected with HTTP `429` (`api_key_account_share_exceeded`, `Retry-After` until the account window resets) once its portion of any active window of any account it used reaches its share. Windows appear after an account has served a request.
 
+## Allowed models and reasoning efforts
+
+`allowed-models` and `allowed-efforts` (on a key or a subscription plan; a key's non-empty list replaces its plan's) restrict what a key may request. An empty or missing list allows everything.
+
+```yaml
+subscriptions:
+  - name: sonnet-only
+    allowed-models: ["claude-sonnet-*"]
+    allowed-efforts: [low, medium]
+keys:
+  - key: "sk-intern"
+    subscription: sonnet-only
+  - key: "sk-reviewer"
+    subscription: sonnet-only
+    allowed-efforts: [low, medium, high]   # replaces the plan's efforts, keeps its models
+  - key: "sk-codex"
+    allowed-models: ["gpt-5.5", "gpt-5.5-mini"]
+```
+
+- **Models** match the model name the client requests (the IDs listed by `/v1/models`), case-insensitively, after removing a thinking suffix such as `(high)` and a `models/` prefix. `*` matches any run of characters. Other models are rejected with HTTP `403` (`api_key_model_not_allowed`) and are hidden from the key's model lists (`/v1/models`, `/v1beta/models`, and the other model catalog endpoints).
+- **Efforts** are the canonical levels `none`, `auto`, `minimal`, `low`, `medium`, `high`, `xhigh` and `max`. The effort is read from the request the same way the proxy reads it for usage logging: OpenAI/Codex `reasoning_effort` / `reasoning.effort`, Claude `output_config.effort` or `thinking` (a token budget is mapped to its level), Gemini `thinkingConfig`, or a model suffix like `claude-opus-5-5(max)`. A request with an effort that is not listed is rejected with HTTP `403` (`api_key_effort_not_allowed`). Requests that set no effort are accepted and use the model's default; list `none` explicitly if keys may also turn thinking off.
+- An unknown value in `allowed-efforts` blocks the key with `api_key_limit_misconfigured`, like other configuration errors.
+- Both lists are reported in the key's status (`allowed_models`, `allowed_efforts`) by `GET /v1/api-key/usage` and the admin usage endpoint.
+
 ## Periods
 
 - `total` (default): the budget never resets.
@@ -86,6 +110,6 @@ Every usage record is also aggregated per month (UTC), client key, upstream cred
 
 The `ghcr.io/<owner>/cliproxyapi-unraid` image built by `.github/workflows/unraid-image.yml` adds three things to the WebUI:
 
-- **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans.
+- **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans, including which models (ticked from the models the proxy currently offers, or typed as patterns) and reasoning efforts each key or plan may use.
 - **Overview**: each key's budget and this month's usage, plus each connected account's provider-reported subscription windows (Claude 5h/7d utilization, Codex used percent).
 - **Analytics**: per-key, per-model and per-account tokens and API-equivalent cost for any recorded month, with a projected month total for the current month.

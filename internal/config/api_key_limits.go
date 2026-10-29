@@ -32,6 +32,16 @@ type APIKeySubscription struct {
 	// account's limit windows (e.g. Claude 5h/7d) a key may consume. It resets
 	// when the account's window resets. Values <= 0 disable it.
 	AccountShare float64 `yaml:"account-share,omitempty" json:"account-share,omitempty"`
+
+	// AllowedModels restricts which models a key may request and list. Entries
+	// match the requested model name case-insensitively and may use "*"
+	// wildcards (e.g. "claude-sonnet-*"). Empty allows every model.
+	AllowedModels []string `yaml:"allowed-models,omitempty" json:"allowed-models,omitempty"`
+
+	// AllowedEfforts restricts which reasoning efforts a key may request:
+	// none, auto, minimal, low, medium, high, xhigh, max. Requests that do not
+	// set an effort are accepted and use the provider default. Empty allows every effort.
+	AllowedEfforts []string `yaml:"allowed-efforts,omitempty" json:"allowed-efforts,omitempty"`
 }
 
 // APIKeyLimit configures one client API key.
@@ -58,6 +68,12 @@ type APIKeyLimit struct {
 
 	// AccountShare overrides the subscription account share. See APIKeySubscription.AccountShare.
 	AccountShare float64 `yaml:"account-share,omitempty" json:"account-share,omitempty"`
+
+	// AllowedModels overrides the subscription model list when non-empty. See APIKeySubscription.AllowedModels.
+	AllowedModels []string `yaml:"allowed-models,omitempty" json:"allowed-models,omitempty"`
+
+	// AllowedEfforts overrides the subscription effort list when non-empty. See APIKeySubscription.AllowedEfforts.
+	AllowedEfforts []string `yaml:"allowed-efforts,omitempty" json:"allowed-efforts,omitempty"`
 }
 
 // LimitedAPIKeys returns the trimmed, non-empty keys configured under api-key-limits.

@@ -154,6 +154,9 @@ access:
   #     - key: "laptop-key"                # at most 10% of each connected subscription
   #       account-share: 10                # account's limit windows (e.g. Claude 5h/7d);
   #                                        # resets when the account's window resets
+  #     - key: "sonnet-only-key"           # only these models ("*" is a wildcard) and
+  #       allowed-models: ["claude-sonnet-*"]  # efforts; others get HTTP 403. Also allowed
+  #       allowed-efforts: ["low", "medium"]   # on subscriptions; a key's list replaces its plan's
 
 # Optional credential concurrency and observation contracts.
 

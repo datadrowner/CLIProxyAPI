@@ -202,10 +202,10 @@ index b4bc63b..d2e46b0 100644
  }
 diff --git a/internal/cliproxy/limits.go b/internal/cliproxy/limits.go
 new file mode 100644
-index 0000000..c10aa8b
+index 0000000..fd3e25f
 --- /dev/null
 +++ b/internal/cliproxy/limits.go
-@@ -0,0 +1,202 @@
+@@ -0,0 +1,208 @@
 +package cliproxy
 +
 +import (
@@ -226,6 +226,9 @@ index 0000000..c10aa8b
 +	Period     string `json:"period,omitempty"`
 +	// AccountShare is the percentage of each connected account's limit windows a key may use.
 +	AccountShare float64 `json:"account-share,omitempty"`
++	// AllowedModels and AllowedEfforts restrict what keys on the plan may request; empty allows all.
++	AllowedModels  []string `json:"allowed-models,omitempty"`
++	AllowedEfforts []string `json:"allowed-efforts,omitempty"`
 +}
 +
 +// LimitedKey is a client API key under access.api-key-limits.
@@ -236,6 +239,9 @@ index 0000000..c10aa8b
 +	TokenLimit   int64   `json:"token-limit,omitempty"`
 +	Period       string  `json:"period,omitempty"`
 +	AccountShare float64 `json:"account-share,omitempty"`
++	// AllowedModels and AllowedEfforts override the plan's lists when non-empty.
++	AllowedModels  []string `json:"allowed-models,omitempty"`
++	AllowedEfforts []string `json:"allowed-efforts,omitempty"`
 +}
 +
 +// AccountShare is a key's estimated portion of one account limit window.
@@ -799,16 +805,17 @@ index 4b43ec5..900f2db 100644
 +}
 diff --git a/internal/web/limits.go b/internal/web/limits.go
 new file mode 100644
-index 0000000..0fe36fb
+index 0000000..6484ce4
 --- /dev/null
 +++ b/internal/web/limits.go
-@@ -0,0 +1,440 @@
+@@ -0,0 +1,493 @@
 +package web
 +
 +import (
 +	"context"
 +	"net/http"
 +	"regexp"
++	"slices"
 +	"strings"
 +	"sync"
 +	"time"
@@ -828,18 +835,55 @@ index 0000000..0fe36fb
 +	TokenLimit   int64              `json:"token_limit"`
 +	Period       string             `json:"period"`
 +	AccountShare float64            `json:"account_share"`
++	Models       []string           `json:"allowed_models"`
++	Efforts      []string           `json:"allowed_efforts"`
 +	Main         bool               `json:"main"`
 +	Usage        *cliproxy.KeyUsage `json:"usage,omitempty"`
 +}
 +
 +type limitInput struct {
-+	ID           string  `json:"id"`
-+	Name         string  `json:"name"`
-+	Subscription string  `json:"subscription"`
-+	TokenLimit   int64   `json:"token_limit"`
-+	Period       string  `json:"period"`
-+	AccountShare float64 `json:"account_share"`
-+	Confirm      bool    `json:"confirm"`
++	ID           string   `json:"id"`
++	Name         string   `json:"name"`
++	Subscription string   `json:"subscription"`
++	TokenLimit   int64    `json:"token_limit"`
++	Period       string   `json:"period"`
++	AccountShare float64  `json:"account_share"`
++	Models       []string `json:"allowed_models"`
++	Efforts      []string `json:"allowed_efforts"`
++	Confirm      bool     `json:"confirm"`
++}
++
++// efforts are the reasoning efforts a key or plan can be restricted to.
++var efforts = []string{"none", "auto", "minimal", "low", "medium", "high", "xhigh", "max"}
++
++// cleanList trims and de-duplicates entries, dropping empty ones.
++func cleanList(values []string) []string {
++	out := []string{}
++	for _, v := range values {
++		v = strings.TrimSpace(v)
++		if v != "" && !slices.Contains(out, v) {
++			out = append(out, v)
++		}
++	}
++	return out
++}
++
++// validAccess checks allowed model patterns and efforts; it returns a message on error.
++func validAccess(models, allowedEfforts []string) string {
++	if len(models) > 200 {
++		return "Too many models"
++	}
++	for _, m := range models {
++		if len(m) > 128 || !validName(m) {
++			return "Model names must be at most 128 characters"
++		}
++	}
++	for _, e := range allowedEfforts {
++		if !slices.Contains(efforts, strings.ToLower(e)) {
++			return "Unknown reasoning effort \"" + e + "\""
++		}
++	}
++	return ""
 +}
 +
 +// keyViews lists the main key and the limited keys with their budget state.
@@ -856,7 +900,7 @@ index 0000000..0fe36fb
 +	main := s.Client.Key()
 +	views := []keyView{{ID: cliproxy.KeyID(main), Name: "Main key (WebUI)", Hint: keyHint(main), Main: true}}
 +	for _, k := range limits.Keys {
-+		v := keyView{ID: cliproxy.KeyID(k.Key), Name: k.Name, Hint: keyHint(k.Key), Subscription: k.Subscription, TokenLimit: k.TokenLimit, Period: k.Period, AccountShare: k.AccountShare}
++		v := keyView{ID: cliproxy.KeyID(k.Key), Name: k.Name, Hint: keyHint(k.Key), Subscription: k.Subscription, TokenLimit: k.TokenLimit, Period: k.Period, AccountShare: k.AccountShare, Models: cleanList(k.AllowedModels), Efforts: cleanList(k.AllowedEfforts)}
 +		if u, ok := usage[v.ID]; ok {
 +			for i := range u.AccountShares {
 +				sh := &u.AccountShares[i]
@@ -917,6 +961,9 @@ index 0000000..0fe36fb
 +	if in.AccountShare < 0 || in.AccountShare > 100 {
 +		return "Account share must be between 0 and 100 percent"
 +	}
++	if msg := validAccess(in.Models, in.Efforts); msg != "" {
++		return msg
++	}
 +	if in.Subscription != "" {
 +		for _, p := range plans {
 +			if p.Name == in.Subscription {
@@ -937,13 +984,19 @@ index 0000000..0fe36fb
 +			problem(w, 502, "Key limits unavailable")
 +			return
 +		}
-+		reply(w, 200, map[string]any{"plans": limits.Subscriptions, "keys": s.keyViews(ctx, limits)})
++		// Models lists what the proxy currently offers, so the UI can offer them as choices.
++		models, _ := s.Client.Models(ctx)
++		if models == nil {
++			models = []string{}
++		}
++		reply(w, 200, map[string]any{"plans": limits.Subscriptions, "keys": s.keyViews(ctx, limits), "models": models, "efforts": efforts})
 +	case path == "/api/limits/keys" && r.Method != "GET":
 +		var in limitInput
 +		if !decode(w, r, &in) {
 +			return
 +		}
 +		in.Name, in.Subscription, in.Period = strings.TrimSpace(in.Name), strings.TrimSpace(in.Subscription), strings.TrimSpace(in.Period)
++		in.Models, in.Efforts = cleanList(in.Models), cleanList(in.Efforts)
 +		s.limitsMu.Lock()
 +		defer s.limitsMu.Unlock()
 +		limits, e := s.Client.Limits(ctx)
@@ -967,7 +1020,7 @@ index 0000000..0fe36fb
 +				problem(w, 500, "Could not generate a key")
 +				return
 +			}
-+			limits.Keys = append(limits.Keys, cliproxy.LimitedKey{Key: key, Name: in.Name, Subscription: in.Subscription, TokenLimit: in.TokenLimit, Period: in.Period, AccountShare: in.AccountShare})
++			limits.Keys = append(limits.Keys, cliproxy.LimitedKey{Key: key, Name: in.Name, Subscription: in.Subscription, TokenLimit: in.TokenLimit, Period: in.Period, AccountShare: in.AccountShare, AllowedModels: in.Models, AllowedEfforts: in.Efforts})
 +			created = key
 +		case "PATCH", "DELETE":
 +			idx := -1
@@ -994,6 +1047,7 @@ index 0000000..0fe36fb
 +			}
 +			k := &limits.Keys[idx]
 +			k.Name, k.Subscription, k.TokenLimit, k.Period, k.AccountShare = in.Name, in.Subscription, in.TokenLimit, in.Period, in.AccountShare
++			k.AllowedModels, k.AllowedEfforts = in.Models, in.Efforts
 +		default:
 +			problem(w, 405, "Method not allowed")
 +			return
@@ -1038,6 +1092,11 @@ index 0000000..0fe36fb
 +			}
 +			if p.TokenLimit < 0 || p.TokenLimit > 1e13 || !validPeriod(p.Period) || p.AccountShare < 0 || p.AccountShare > 100 {
 +				problem(w, 400, "Invalid plan limit or period")
++				return
++			}
++			p.AllowedModels, p.AllowedEfforts = cleanList(p.AllowedModels), cleanList(p.AllowedEfforts)
++			if msg := validAccess(p.AllowedModels, p.AllowedEfforts); msg != "" {
++				problem(w, 400, msg)
 +				return
 +			}
 +			seen[p.Name] = true
@@ -1245,10 +1304,10 @@ index 0000000..0fe36fb
 +}
 diff --git a/internal/web/limits_test.go b/internal/web/limits_test.go
 new file mode 100644
-index 0000000..aaaa4a0
+index 0000000..7b670cf
 --- /dev/null
 +++ b/internal/web/limits_test.go
-@@ -0,0 +1,236 @@
+@@ -0,0 +1,280 @@
 +package web
 +
 +import (
@@ -1450,6 +1509,50 @@ index 0000000..aaaa4a0
 +	}
 +}
 +
++func TestModelAndEffortRestrictions(t *testing.T) {
++	m, do := limitsFixture(t)
++	if w := do("PUT", "/api/limits/plans", `{"plans":[{"name":"lite","allowed-efforts":["turbo"]}]}`); w.Code != 400 {
++		t.Fatal("unknown plan effort accepted", w.Code)
++	}
++	if w := do("POST", "/api/limits/keys", `{"name":"x","allowed_efforts":["high","bogus"]}`); w.Code != 400 {
++		t.Fatal("unknown key effort accepted", w.Code)
++	}
++	decodeBody(t, do("PUT", "/api/limits/plans", `{"plans":[{"name":"lite","allowed-models":[" claude-haiku-* ",""],"allowed-efforts":["low"]}]}`), &map[string]bool{})
++	var created struct{ ID, Key string }
++	decodeBody(t, do("POST", "/api/limits/keys", `{"name":"sonnet","subscription":"lite","allowed_models":["claude-sonnet-5-5","claude-sonnet-5-5"],"allowed_efforts":["low","medium"]}`), &created)
++
++	var list struct {
++		Plans   []cliproxy.Plan `json:"plans"`
++		Keys    []keyView       `json:"keys"`
++		Models  []string        `json:"models"`
++		Efforts []string        `json:"efforts"`
++	}
++	decodeBody(t, do("GET", "/api/limits", ""), &list)
++	if len(list.Models) != 1 || list.Models[0] != "mock-model" || len(list.Efforts) != 8 {
++		t.Fatalf("choices = %v / %v", list.Models, list.Efforts)
++	}
++	if k := list.Keys[1]; len(k.Models) != 1 || k.Models[0] != "claude-sonnet-5-5" || len(k.Efforts) != 2 {
++		t.Fatalf("key = %+v", k)
++	}
++
++	var saved cliproxy.Limits
++	if e := json.Unmarshal(m.Limits, &saved); e != nil {
++		t.Fatal(e)
++	}
++	if p := saved.Subscriptions[0]; len(p.AllowedModels) != 1 || p.AllowedModels[0] != "claude-haiku-*" || p.AllowedEfforts[0] != "low" {
++		t.Fatalf("saved plan = %+v", p)
++	}
++	if !strings.Contains(string(m.Limits), `"allowed-models":["claude-sonnet-5-5"]`) {
++		t.Fatalf("saved limits = %s", m.Limits)
++	}
++
++	// Clearing the lists lets the key inherit the plan's again.
++	decodeBody(t, do("PATCH", "/api/limits/keys", `{"id":"`+created.ID+`","name":"sonnet","subscription":"lite"}`), &map[string]bool{})
++	if strings.Contains(string(m.Limits), "claude-sonnet-5-5") {
++		t.Fatalf("cleared key lists still saved: %s", m.Limits)
++	}
++}
++
 +func TestLiveClaudePlanUsage(t *testing.T) {
 +	m, do := limitsFixture(t)
 +	m.Claude = true
@@ -1633,7 +1736,7 @@ index d664300..59f5f3a 100644
  document.querySelectorAll('.copy-url').forEach(b => b.addEventListener('click', action(() => copy(baseURL))));
  document.querySelectorAll('.copy-key').forEach(b => b.addEventListener('click', action(async () => { const d = await api('key'); await copy(d.key); })));
 diff --git a/web/static/index.html b/web/static/index.html
-index d6488c6..57eeb82 100644
+index d6488c6..d8d248e 100644
 --- a/web/static/index.html
 +++ b/web/static/index.html
 @@ -1,11 +1,11 @@
@@ -1651,13 +1754,13 @@ index d6488c6..57eeb82 100644
 +<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><article id="paste-callback"><h2>Paste a callback URL</h2><p>Signed in on another computer and the browser ended on a localhost page that could not load? Click Connect first, sign in, then copy the complete URL from the browser address bar and paste it here. This works even after reloading this page, within 5 minutes of clicking Connect.</p><form id="paste-callback-form"><label for="paste-callback-url">Callback URL</label><input id="paste-callback-url" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:54545/callback?code=…&amp;state=…"><button type="submit">Submit callback URL</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
  <section id="access" class="page" hidden><p class="eyebrow">PLUG INTO YOUR TOOLS</p><h1>API Access.</h1><article><h2>Base URL</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button><h2>API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button><p>Use this URL and key in an OpenAI-compatible client. Choose a model shown on Overview.</p><hr><p>Existing clients using this key will stop working after key regeneration.</p><button id="rotate" class="danger">Regenerate API Key</button></article></section>
 -<section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
-+<section id="keys" class="page" hidden><p class="eyebrow">SHARE ACCESS SAFELY</p><h1>API keys.</h1><p>Create a key for each person or tool. A key can have full usage, a token budget, or follow a subscription plan. Changes apply immediately; a key that used up its budget gets HTTP 429 until it resets.</p><article><h2 id="key-form-title">Create a key</h2><form id="key-form"><input id="key-id" type="hidden"><label for="key-name">Name</label><input id="key-name" maxlength="64" placeholder="e.g. Laptop, Alice, CI"><label for="key-mode">Limit</label><select id="key-mode"><option value="full">Full usage (no limit)</option><option value="tokens">Token budget</option><option value="plan">Subscription plan</option></select><div id="key-tokens-fields" hidden><label for="key-limit">Tokens</label><input id="key-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="key-period">Resets</label><select id="key-period" class="period"><option value="total">Never (one-off budget)</option><option value="daily">Daily (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="monthly">Monthly (UTC)</option><option value="custom">Custom window…</option></select><input id="key-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="key-plan-fields" hidden><label for="key-plan">Plan</label><select id="key-plan"></select><p id="key-plan-empty" hidden>No plans yet. Add one under Subscription plans below.</p></div><label for="key-share">Share of each connected subscription account (optional)</label><input id="key-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10 — empty means no share limit"><p class="field-hint">Limits how much of each account's own limit windows (for example Claude's 5-hour and 7-day windows) this key may use. It resets when the account's window resets. A key on a plan uses the plan's share unless you set one here.</p><button type="submit" id="key-submit">Create key</button><button type="button" id="key-cancel" hidden>Cancel</button></form><div id="key-created" hidden><p>New key created. Copy it now and store it safely; you can copy it again later from the list.</p><code id="key-created-value"></code><button id="key-created-copy">Copy key</button></div></article><h2>Your keys</h2><div id="key-list" class="grid"></div><article><h2>Subscription plans</h2><p>Plans are reusable limits, for example "Starter: 1M tokens per month". Keys on a plan follow it; changing a plan updates every key on it.</p><div id="plan-list" class="usage-list"></div><form id="plan-form"><h3>Add a plan</h3><label for="plan-name">Plan name</label><input id="plan-name" maxlength="40" placeholder="e.g. starter"><label for="plan-limit">Tokens (optional)</label><input id="plan-limit" type="number" min="1" step="1" placeholder="e.g. 1000000 — empty means no token limit"><label for="plan-period">Resets</label><select id="plan-period" class="period"><option value="monthly">Monthly (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="daily">Daily (UTC)</option><option value="total">Never (one-off budget)</option><option value="custom">Custom window…</option></select><input id="plan-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden><label for="plan-share">Share of each connected subscription account (optional)</label><input id="plan-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10"><button type="submit">Add plan</button></form></article></section><section id="analytics" class="page" hidden><p class="eyebrow">WHAT IT WOULD COST</p><h1>Analytics.</h1><p>Tokens of all calls through this proxy and what they would cost at Anthropic API list prices, per month. Models without a known Anthropic price (for example OpenAI models) show tokens only. Cache writes are priced at the 5-minute rate.</p><label for="analytics-month">Month</label><select id="analytics-month"></select><div id="analytics-totals" class="grid"></div><article><h2>Per API key</h2><div class="table-wrap"><table id="analytics-keys"></table></div></article><article><h2>Per model</h2><div class="table-wrap"><table id="analytics-models"></table></div></article><article><h2>Per connected account</h2><div class="table-wrap"><table id="analytics-accounts"></table></div></article><details><summary>Anthropic API price table (USD per million tokens)</summary><p id="pricing-source"></p><div class="table-wrap"><table id="analytics-pricing"></table></div></details></section><section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
++<section id="keys" class="page" hidden><p class="eyebrow">SHARE ACCESS SAFELY</p><h1>API keys.</h1><p>Create a key for each person or tool. A key can have full usage, a token budget, or follow a subscription plan, and can be limited to certain models and reasoning efforts. Changes apply immediately; a key that used up its budget gets HTTP 429 until it resets.</p><article><h2 id="key-form-title">Create a key</h2><form id="key-form"><input id="key-id" type="hidden"><label for="key-name">Name</label><input id="key-name" maxlength="64" placeholder="e.g. Laptop, Alice, CI"><label for="key-mode">Limit</label><select id="key-mode"><option value="full">Full usage (no limit)</option><option value="tokens">Token budget</option><option value="plan">Subscription plan</option></select><div id="key-tokens-fields" hidden><label for="key-limit">Tokens</label><input id="key-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="key-period">Resets</label><select id="key-period" class="period"><option value="total">Never (one-off budget)</option><option value="daily">Daily (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="monthly">Monthly (UTC)</option><option value="custom">Custom window…</option></select><input id="key-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="key-plan-fields" hidden><label for="key-plan">Plan</label><select id="key-plan"></select><p id="key-plan-empty" hidden>No plans yet. Add one under Subscription plans below.</p></div><label for="key-share">Share of each connected subscription account (optional)</label><input id="key-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10 — empty means no share limit"><p class="field-hint">Limits how much of each account's own limit windows (for example Claude's 5-hour and 7-day windows) this key may use. It resets when the account's window resets. A key on a plan uses the plan's share unless you set one here.</p><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models this key may use; nothing ticked allows every model. Other models are rejected and hidden from its model list. A key on a plan uses the plan's models and efforts unless you tick some here.</p><div id="key-models" class="choices"></div><label for="key-models-extra">More models or patterns</label><input id="key-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts this key may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="key-efforts" class="choices"></div></fieldset><button type="submit" id="key-submit">Create key</button><button type="button" id="key-cancel" hidden>Cancel</button></form><div id="key-created" hidden><p>New key created. Copy it now and store it safely; you can copy it again later from the list.</p><code id="key-created-value"></code><button id="key-created-copy">Copy key</button></div></article><h2>Your keys</h2><div id="key-list" class="grid"></div><article><h2>Subscription plans</h2><p>Plans are reusable limits, for example "Starter: 1M tokens per month, Sonnet only". Adding a plan with an existing name replaces it. Keys on a plan follow it; changing a plan updates every key on it.</p><div id="plan-list" class="usage-list"></div><form id="plan-form"><h3>Add a plan</h3><label for="plan-name">Plan name</label><input id="plan-name" maxlength="40" placeholder="e.g. starter"><label for="plan-limit">Tokens (optional)</label><input id="plan-limit" type="number" min="1" step="1" placeholder="e.g. 1000000 — empty means no token limit"><label for="plan-period">Resets</label><select id="plan-period" class="period"><option value="monthly">Monthly (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="daily">Daily (UTC)</option><option value="total">Never (one-off budget)</option><option value="custom">Custom window…</option></select><input id="plan-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden><label for="plan-share">Share of each connected subscription account (optional)</label><input id="plan-share" type="number" min="0" max="100" step="0.1" placeholder="Percent, e.g. 10"><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models keys on this plan may use; nothing ticked allows every model. Other models are rejected and hidden from its model list.</p><div id="plan-models" class="choices"></div><label for="plan-models-extra">More models or patterns</label><input id="plan-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts keys on this plan may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="plan-efforts" class="choices"></div></fieldset><button type="submit">Add plan</button></form></article></section><section id="analytics" class="page" hidden><p class="eyebrow">WHAT IT WOULD COST</p><h1>Analytics.</h1><p>Tokens of all calls through this proxy and what they would cost at Anthropic API list prices, per month. Models without a known Anthropic price (for example OpenAI models) show tokens only. Cache writes are priced at the 5-minute rate.</p><label for="analytics-month">Month</label><select id="analytics-month"></select><div id="analytics-totals" class="grid"></div><article><h2>Per API key</h2><div class="table-wrap"><table id="analytics-keys"></table></div></article><article><h2>Per model</h2><div class="table-wrap"><table id="analytics-models"></table></div></article><article><h2>Per connected account</h2><div class="table-wrap"><table id="analytics-accounts"></table></div></article><details><summary>Anthropic API price table (USD per million tokens)</summary><p id="pricing-source"></p><div class="table-wrap"><table id="analytics-pricing"></table></div></details></section><section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
  </main><footer>CLIProxyAPI is a third-party project. Provider availability and authentication methods are controlled by their respective services.</footer></body></html>
 diff --git a/web/static/style.css b/web/static/style.css
-index 614cbbf..9ebf4e8 100644
+index 614cbbf..6720565 100644
 --- a/web/static/style.css
 +++ b/web/static/style.css
-@@ -1 +1,22 @@
+@@ -1 +1,27 @@
  :root{font-family:system-ui,-apple-system,sans-serif;color:#e6ebf1;background:#10151c;font-size:16px;color-scheme:dark}*{box-sizing:border-box}body{margin:0}header{display:flex;align-items:center;gap:16px;border-bottom:1px solid #2a333f;padding:24px 6vw}header strong{font-size:20px}small{display:block;color:#9babbc;margin-top:5px}.mark{border:1px solid #64748b;border-radius:12px;padding:10px;font-weight:800}.mark span{color:#9de4b7}#logout{margin-left:auto}main{max-width:1100px;margin:0 auto;padding:35px 24px 70px}h1{font-size:clamp(32px,5vw,52px);letter-spacing:-.045em;line-height:1.15;margin:16px 0 32px}h2{font-size:19px;margin-top:0}h3{margin-top:0}.eyebrow{font-size:12px;color:#9de4b7;letter-spacing:.16em;font-weight:700}p{line-height:1.6;color:#b4c1cf}article{background:#19212c;border:1px solid #303c4c;border-radius:14px;padding:25px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}.grid article{margin:0}button,a{cursor:pointer}button{font:inherit;border:1px solid #45556a;border-radius:7px;padding:10px 15px;background:#27384b;color:#eef5fa;margin:10px 10px 0 0}button:hover{background:#354b61}button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid #9de4b7;outline-offset:4px}button:disabled{opacity:.5;cursor:wait}a{color:#9de4b7}nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:40px}nav button{background:transparent;border-color:transparent}nav .selected{background:#254333;color:#bbf4cf}.danger{border-color:#925654;color:#ffb4ab}label{display:block;line-height:1.6;margin:16px 0 8px}input{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}#login{max-width:620px;margin:35px auto}#login-form{max-width:420px}code{display:block;overflow-wrap:anywhere;color:#b8e3f6;font-size:15px;margin:15px 0}#notice:empty{display:none}#notice{padding:14px;border-left:3px solid #9de4b7;background:#1a3028;margin-bottom:24px}li{padding:8px;border-bottom:1px solid #303c4c}ul{padding-left:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.7}footer{border-top:1px solid #2a333f;color:#8292a4;text-align:center;font-size:12px;padding:24px}hr{border:0;border-top:1px solid #354253;margin:30px 0}[hidden]{display:none!important}@media(max-width:600px){header{padding:20px}main{padding:24px 16px}article{padding:20px}nav{gap:0}nav button{padding:9px}h1{margin-bottom:24px}}
 +select{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}
 +meter{display:block;width:100%;height:12px;margin:8px 0}
@@ -1680,12 +1783,17 @@ index 614cbbf..9ebf4e8 100644
 +#analytics-month{max-width:280px}
 +#analytics-totals{margin:28px 0 36px}
 +#analytics-totals h2{margin-bottom:4px}
++fieldset{border:1px solid #303c4c;border-radius:10px;padding:6px 16px 16px;margin:18px 0}
++legend{padding:0 6px;color:#e6ebf1}
++.choices{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:0 16px;max-height:260px;overflow-y:auto;margin-top:8px}
++.choices label{display:flex;gap:8px;align-items:center;margin:4px 0;overflow-wrap:anywhere}
++.choices input{width:auto;flex:none}
 diff --git a/web/static/usage.js b/web/static/usage.js
 new file mode 100644
-index 0000000..57e98db
+index 0000000..a0877f7
 --- /dev/null
 +++ b/web/static/usage.js
-@@ -0,0 +1,213 @@
+@@ -0,0 +1,242 @@
 +'use strict';
 +// API keys, usage overview and analytics. Uses helpers from app.js.
 +const fmtInt = new Intl.NumberFormat();
@@ -1696,7 +1804,27 @@ index 0000000..57e98db
 +const usdText = n => (n > 0 && n < 1 ? fmtUSDSmall : fmtUSD).format(n || 0);
 +const periodText = p => ({'': 'never resets', total: 'never resets', daily: 'per day', weekly: 'per week', monthly: 'per month'})[p || ''] || 'per ' + p;
 +const whenText = t => { if (!t || t.startsWith('0001')) return ''; const d = new Date(t); return isNaN(d) ? '' : d.toLocaleString(); };
-+let plans = [], keyRows = [];
++let plans = [], keyRows = [], modelOptions = [], effortOptions = [];
++
++// Model and effort restrictions; an empty list allows everything.
++function renderChoices(id, options, selected) {
++  selected = selected || [];
++  const all = options.concat(selected.filter(v => !options.includes(v)));
++  $(id).replaceChildren(...(all.length ? all.map(v => {
++    const label = element('label', ''), box = document.createElement('input');
++    box.type = 'checkbox'; box.value = v; box.checked = selected.includes(v);
++    label.append(box, element('span', v)); return label;
++  }) : [element('small', 'No models reported yet; connect a provider or type model names below.')]));
++}
++function readChoices(id, extraId) {
++  const picked = [...$(id).querySelectorAll('input:checked')].map(b => b.value);
++  const extra = extraId ? $(extraId).value.split(',').map(s => s.trim()).filter(Boolean) : [];
++  return [...new Set(picked.concat(extra))];
++}
++function renderAccessChoices(prefix, models, efforts) {
++  renderChoices(prefix + '-models', modelOptions, models); renderChoices(prefix + '-efforts', effortOptions, efforts); $(prefix + '-models-extra').value = '';
++}
++const accessText = (models, efforts) => [models && models.length ? 'Models: ' + models.join(', ') : '', efforts && efforts.length ? 'Efforts: ' + efforts.join(', ') : ''].filter(Boolean);
 +
 +function meter(value, max, label) {
 +  const m = document.createElement('meter'); m.min = 0; m.max = max || 1; m.value = Math.min(value, max || 1); m.low = (max || 1) * 0.7; m.high = (max || 1) * 0.9; m.optimum = 0;
@@ -1716,6 +1844,10 @@ index 0000000..57e98db
 +  const tokens = tokenText(k); if (tokens) parts.push(tokens);
 +  const share = (k.usage && k.usage.account_share) || k.account_share;
 +  if (share > 0) parts.push(shareText(share) + ' of each account');
++  const plan = plans.find(p => p.name === k.subscription);
++  const models = (k.allowed_models && k.allowed_models.length) ? k.allowed_models : plan && plan.models;
++  const efforts = (k.allowed_efforts && k.allowed_efforts.length) ? k.allowed_efforts : plan && plan.efforts;
++  parts.push(...accessText(models, efforts));
 +  return parts.length ? parts.join(' · ') : 'Full usage';
 +}
 +// Appends one line and meter per account window the key has used.
@@ -1780,18 +1912,23 @@ index 0000000..57e98db
 +}
 +function resetKeyForm() {
 +  $('key-form').reset(); $('key-id').value = ''; $('key-form-title').textContent = 'Create a key'; $('key-submit').textContent = 'Create key'; $('key-cancel').hidden = true;
-+  setPeriod($('key-period'), $('key-period-custom'), 'total'); syncKeyMode();
++  setPeriod($('key-period'), $('key-period-custom'), 'total'); renderAccessChoices('key', [], []); syncKeyMode();
 +}
 +function editKey(k) {
 +  $('key-id').value = k.id; $('key-name').value = k.name; $('key-form-title').textContent = 'Edit ' + (k.name || k.hint); $('key-submit').textContent = 'Save changes'; $('key-cancel').hidden = false;
 +  $('key-mode').value = k.subscription ? 'plan' : (k.token_limit > 0 ? 'tokens' : 'full');
 +  $('key-limit').value = k.token_limit > 0 ? k.token_limit : ''; $('key-share').value = k.account_share > 0 ? k.account_share : ''; setPeriod($('key-period'), $('key-period-custom'), k.period);
 +  if (k.subscription) $('key-plan').value = k.subscription;
++  renderAccessChoices('key', k.allowed_models, k.allowed_efforts);
 +  syncKeyMode(); $('key-form').scrollIntoView({behavior: 'smooth'});
 +}
 +async function keysPage() {
 +  const d = await api('limits');
-+  plans = d.plans.map(p => ({name: p.name, token_limit: p['token-limit'] || 0, period: p.period || '', share: p['account-share'] || 0})); keyRows = d.keys;
++  plans = d.plans.map(p => ({name: p.name, token_limit: p['token-limit'] || 0, period: p.period || '', share: p['account-share'] || 0, models: p['allowed-models'] || [], efforts: p['allowed-efforts'] || []})); keyRows = d.keys;
++  modelOptions = d.models || []; effortOptions = d.efforts || [];
++  // Re-render the choices with the current options, keeping what is already ticked.
++  if (!$('key-id').value) renderAccessChoices('key', readChoices('key-models'), readChoices('key-efforts'));
++  renderAccessChoices('plan', readChoices('plan-models'), readChoices('plan-efforts'));
 +  $('key-plan').replaceChildren(...plans.map(p => { const o = element('option', p.name + ' · ' + planText(p)); o.value = p.name; return o; }));
 +  syncKeyMode();
 +  $('key-list').replaceChildren(...keyRows.map(k => {
@@ -1818,14 +1955,14 @@ index 0000000..57e98db
 +    return row;
 +  }) : [element('p', 'No plans yet.')]));
 +}
-+const planText = p => [p.token_limit > 0 ? tokensText(p.token_limit) + ' tokens ' + periodText(p.period) : '', p.share > 0 ? shareText(p.share) + ' of each account' : ''].filter(Boolean).join(' · ') || 'full usage';
-+const savePlans = list => api('limits/plans', 'PUT', {plans: list.map(x => ({name: x.name, 'token-limit': x.token_limit, period: x.period, 'account-share': x.share || 0}))});
++const planText = p => [p.token_limit > 0 ? tokensText(p.token_limit) + ' tokens ' + periodText(p.period) : '', p.share > 0 ? shareText(p.share) + ' of each account' : '', ...accessText(p.models, p.efforts)].filter(Boolean).join(' · ') || 'full usage';
++const savePlans = list => api('limits/plans', 'PUT', {plans: list.map(x => ({name: x.name, 'token-limit': x.token_limit, period: x.period, 'account-share': x.share || 0, 'allowed-models': x.models || [], 'allowed-efforts': x.efforts || []}))});
 +document.querySelectorAll('select.period').forEach(s => s.addEventListener('change', () => { s.nextElementSibling.hidden = s.value !== 'custom'; }));
 +$('key-mode').addEventListener('change', syncKeyMode);
 +$('key-cancel').addEventListener('click', resetKeyForm);
 +$('key-form').addEventListener('submit', action(async () => {
 +  const mode = $('key-mode').value, id = $('key-id').value;
-+  const body = {name: $('key-name').value.trim(), subscription: '', token_limit: 0, period: '', account_share: parseFloat($('key-share').value) || 0};
++  const body = {name: $('key-name').value.trim(), subscription: '', token_limit: 0, period: '', account_share: parseFloat($('key-share').value) || 0, allowed_models: readChoices('key-models', 'key-models-extra'), allowed_efforts: readChoices('key-efforts')};
 +  if (body.account_share < 0 || body.account_share > 100) throw new Error('Account share must be between 0 and 100 percent.');
 +  if (mode === 'tokens') { body.token_limit = parseInt($('key-limit').value, 10) || 0; body.period = periodValue($('key-period'), $('key-period-custom')); if (body.token_limit <= 0) throw new Error('Enter a token budget greater than 0.'); }
 +  if (mode === 'plan') { body.subscription = $('key-plan').value; if (!body.subscription) throw new Error('Add a subscription plan first.'); }
@@ -1836,13 +1973,13 @@ index 0000000..57e98db
 +}));
 +$('key-created-copy').addEventListener('click', action(() => copy($('key-created-value').textContent)));
 +$('plan-form').addEventListener('submit', action(async () => {
-+  const p = {name: $('plan-name').value.trim(), token_limit: parseInt($('plan-limit').value, 10) || 0, period: periodValue($('plan-period'), $('plan-period-custom')), share: parseFloat($('plan-share').value) || 0};
++  const p = {name: $('plan-name').value.trim(), token_limit: parseInt($('plan-limit').value, 10) || 0, period: periodValue($('plan-period'), $('plan-period-custom')), share: parseFloat($('plan-share').value) || 0, models: readChoices('plan-models', 'plan-models-extra'), efforts: readChoices('plan-efforts')};
 +  if (!p.name) throw new Error('Enter a plan name.');
-+  if (p.token_limit <= 0 && p.share <= 0) throw new Error('Enter a token budget, an account share, or both.');
++  if (p.token_limit <= 0 && p.share <= 0 && !p.models.length && !p.efforts.length) throw new Error('Set a token budget, an account share, models or efforts.');
 +  if (p.share < 0 || p.share > 100) throw new Error('Account share must be between 0 and 100 percent.');
 +  if (p.period === 'total') p.period = '';
 +  await savePlans(plans.filter(x => x.name !== p.name).concat([p]));
-+  $('plan-form').reset(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly'); message('Plan saved.'); await keysPage();
++  $('plan-form').reset(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly'); renderAccessChoices('plan', [], []); message('Plan saved.'); await keysPage();
 +}));
 +
 +// ---- Analytics ----
@@ -1898,4 +2035,4 @@ index 0000000..57e98db
 +  if (target && page !== 'dashboard') { target.click(); return; }
 +  try { await usageOverview(); } catch (e) { message(e.message); }
 +};
-+resetKeyForm(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly');
++resetKeyForm(); setPeriod($('plan-period'), $('plan-period-custom'), 'monthly'); renderAccessChoices('plan', [], []);

@@ -57,6 +57,10 @@ type Status struct {
 	AccountShare float64 `json:"account_share,omitempty"`
 	// AccountShares lists the key's estimated portion of each active account window.
 	AccountShares []AccountShare `json:"account_shares,omitempty"`
+	// AllowedModels lists the model patterns the key may use; empty allows all.
+	AllowedModels []string `json:"allowed_models,omitempty"`
+	// AllowedEfforts lists the reasoning efforts the key may request; empty allows all.
+	AllowedEfforts []string `json:"allowed_efforts,omitempty"`
 }
 
 // LimitError reports why a key may not start a new request.
@@ -76,6 +80,10 @@ type policy struct {
 	limit        int64
 	period       period
 	accountShare float64
+	// allowedModels holds lower-cased model patterns; empty allows every model.
+	allowedModels []string
+	// allowedEfforts holds lower-cased effort levels; empty allows every effort.
+	allowedEfforts []string
 	// invalid holds a configuration error; such keys are rejected (fail closed).
 	invalid string
 }
@@ -211,6 +219,8 @@ func buildPolicies(cfg config.APIKeyLimitsConfig) map[string]policy {
 			}
 			p.limit = sub.TokenLimit
 			p.accountShare = sub.AccountShare
+			p.allowedModels = normalizeList(sub.AllowedModels)
+			p.allowedEfforts = normalizeList(sub.AllowedEfforts)
 			if rawPeriod == "" {
 				rawPeriod = strings.TrimSpace(sub.Period)
 			}
@@ -220,6 +230,16 @@ func buildPolicies(cfg config.APIKeyLimitsConfig) map[string]policy {
 		}
 		if entry.AccountShare > 0 {
 			p.accountShare = entry.AccountShare
+		}
+		if models := normalizeList(entry.AllowedModels); len(models) > 0 {
+			p.allowedModels = models
+		}
+		if efforts := normalizeList(entry.AllowedEfforts); len(efforts) > 0 {
+			p.allowedEfforts = efforts
+		}
+		if bad := invalidEffort(p.allowedEfforts); bad != "" {
+			p.invalid = fmt.Sprintf("unknown allowed effort %q", bad)
+			log.Errorf("api-key-limits: key %q has an unknown allowed effort %q; the key is blocked", displayName(p, key), bad)
 		}
 		if p.accountShare > 100 {
 			p.invalid = fmt.Sprintf("account-share %.4g must be at most 100", p.accountShare)
@@ -415,6 +435,8 @@ func (l *Limiter) statusLocked(apiKey string, p policy, now time.Time) Status {
 	if !status.Unlimited {
 		status.RemainingTokens = max(p.limit-c.Tokens, 0)
 	}
+	status.AllowedModels = p.allowedModels
+	status.AllowedEfforts = p.allowedEfforts
 	if p.accountShare > 0 {
 		status.AccountShare = p.accountShare
 		status.AccountShares = l.accountSharesLocked(status.ID, p.accountShare, now)
