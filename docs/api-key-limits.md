@@ -110,6 +110,6 @@ Every usage record is also aggregated per month (UTC), client key, upstream cred
 
 The `ghcr.io/<owner>/cliproxyapi-unraid` image built by `.github/workflows/unraid-image.yml` adds three things to the WebUI:
 
-- **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans, including which models (ticked from the models the proxy currently offers, or typed as patterns) and reasoning efforts each key or plan may use.
+- **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans. The limit is one type per key or plan: full usage, a token budget, a share of each subscription account, or (keys only) a plan. Combining a token budget and an account share is still possible in the config file. Keys and plans can also be restricted to the models (ticked from the models the proxy currently offers, or typed as patterns) and reasoning efforts each key or plan may use.
 - **Overview**: each key's budget and this month's usage, plus each connected account's provider-reported subscription windows (Claude 5h/7d utilization, Codex used percent).
 - **Analytics**: per-key, per-model and per-account tokens and API-equivalent cost for any recorded month, with a projected month total for the current month.
