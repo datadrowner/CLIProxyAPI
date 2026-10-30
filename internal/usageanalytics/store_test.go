@@ -126,3 +126,44 @@ func TestStoreAggregatesAndPersists(t *testing.T) {
 		t.Fatalf("reloaded rows = %+v", rows)
 	}
 }
+
+func TestStoreRecordsDaysAndTrend(t *testing.T) {
+	dir := t.TempDir()
+	cfg := &config.Config{}
+	cfg.AuthDir = dir
+	s := New()
+	s.Configure(cfg)
+	record := func(at time.Time, model string, input int64) {
+		s.HandleUsage(context.Background(), coreusage.Record{APIKey: "k", Model: model, RequestedAt: at, Detail: claudeDetail(input, 0, 0, 0)})
+	}
+	record(time.Date(2026, 10, 3, 23, 30, 0, 0, time.UTC), "claude-opus-5-5", 1_000_000)
+	record(time.Date(2026, 10, 3, 1, 0, 0, 0, time.UTC), "gpt-5.4", 200)
+	record(time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC), "claude-opus-5-5", 500_000)
+	record(time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC), "claude-opus-5-5", 250_000)
+
+	report := s.Report("2026-10")
+	if len(report.Days) != 2 || report.Days[0].Period != "2026-10-03" || report.Days[1].Period != "2026-10-07" {
+		t.Fatalf("days = %+v", report.Days)
+	}
+	if d := report.Days[0]; d.Requests != 2 || d.TotalTokens != 1_000_200 || !almost(d.CostUSD, 4) || d.UnpricedTokens != 200 {
+		t.Fatalf("2026-10-03 = %+v", d)
+	}
+	if len(report.Trend) != 2 || report.Trend[0].Period != "2026-09" || !almost(report.Trend[0].CostUSD, 1) || report.Trend[1].Period != "2026-10" || !almost(report.Trend[1].CostUSD, 6) {
+		t.Fatalf("trend = %+v", report.Trend)
+	}
+
+	s.Flush()
+	reloaded := New()
+	reloaded.Configure(cfg)
+	if days := reloaded.Report("2026-10").Days; len(days) != 2 || days[1].TotalTokens != 500_000 {
+		t.Fatalf("reloaded days = %+v", days)
+	}
+
+	// Days of pruned months are dropped with them.
+	for m := 1; m <= retainedMonths; m++ {
+		record(time.Date(2027, time.Month(m), 1, 0, 0, 0, 0, time.UTC), "claude-opus-5-5", 1)
+	}
+	if days := s.Report("2026-10").Days; len(days) != 0 {
+		t.Fatalf("days of pruned months kept: %+v", days)
+	}
+}

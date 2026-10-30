@@ -106,7 +106,9 @@ State files must not end in `.json` when they live in the auth directory: CLIPro
 
 Every usage record is also aggregated per month (UTC), client key, upstream credential (`auth_index`) and model into `<auth-dir>/usage-analytics.state` (key digests only, 13 months kept, flushed every 15 seconds). For Anthropic models the record is priced at Anthropic API list prices: uncached input, cache reads and cache writes (5-minute rate, since the TTL is not reported) and output, including the Claude Haiku 5.5 long-prompt tier and the 2× fast-mode rate. Other models are counted in tokens only.
 
-`GET /v8/management/observability/usage/analytics?month=YYYY-MM` returns the rows, key labels, and the price table with its source.
+Totals per UTC day are recorded as well (kept as long as their month), starting with the version that added them; earlier usage only has monthly rows.
+
+`GET /v8/management/observability/usage/analytics?month=YYYY-MM` returns the rows, key labels, the price table with its source, the month's daily totals (`days`) and every retained month's totals (`trend`).
 
 ## Unraid WebUI
 
@@ -114,6 +116,6 @@ The `ghcr.io/<owner>/cliproxyapi-unraid` image built by `.github/workflows/unrai
 
 - **API Keys**: create, edit, copy and delete limited keys, and manage subscription plans. The limit is one type per key or plan: full usage, a token budget, a share of each subscription account, or (keys only) a plan. Combining a token budget and an account share is still possible in the config file. Keys and plans can also be restricted to the models (ticked from the models the proxy currently offers, or typed as patterns) and reasoning efforts each key or plan may use.
 - **Overview**: each key's budget and this month's usage, plus each connected account's provider-reported subscription windows (Claude 5h/7d utilization, Codex used percent).
-- **Analytics**: per-key, per-model and per-account tokens and API-equivalent cost for any recorded month, with a projected month total for the current month.
+- **Analytics**: per-key, per-model and per-account tokens and API-equivalent cost for any recorded month, with a projected month total for the current month. Charts show usage per day and per month (click a month to open it) and the largest keys, models and accounts, as cost or tokens.
 
 The WebUI reopens on the page you last used, and an **Auto-refresh** switch in the navigation reloads Overview, Analytics and Logs every 30 seconds while the tab is visible. Both are remembered per browser.

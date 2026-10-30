@@ -61,11 +61,32 @@ type Row struct {
 	UnpricedTokens int64 `json:"unpriced_tokens"`
 }
 
+// Totals aggregates all usage of one day ("YYYY-MM-DD") or month ("YYYY-MM").
+type Totals struct {
+	Period         string  `json:"period"`
+	Requests       int64   `json:"requests"`
+	TotalTokens    int64   `json:"total_tokens"`
+	CostUSD        float64 `json:"cost_usd"`
+	UnpricedTokens int64   `json:"unpriced_tokens"`
+}
+
+func (t *Totals) add(requests, tokens int64, costUSD float64, unpriced int64) {
+	t.Requests += requests
+	t.TotalTokens += tokens
+	t.CostUSD += costUSD
+	t.UnpricedTokens += unpriced
+}
+
 // Report is the analytics view for one month.
 type Report struct {
 	Month  string   `json:"month"`
 	Months []string `json:"months"`
 	Rows   []Row    `json:"rows"`
+	// Days lists the recorded days of the month in date order. Days are
+	// recorded since daily totals were added; earlier usage has none.
+	Days []Totals `json:"days"`
+	// Trend lists every retained month's totals, oldest first.
+	Trend []Totals `json:"trend"`
 	// Keys maps key IDs to configured names or masked keys.
 	Keys          map[string]string `json:"keys"`
 	Pricing       []Price           `json:"pricing"`
@@ -75,12 +96,15 @@ type Report struct {
 type stateFile struct {
 	Version int                        `json:"version"`
 	Months  map[string]map[string]*Row `json:"months"`
+	// Days maps "YYYY-MM-DD" (UTC) to that day's totals.
+	Days map[string]*Totals `json:"days,omitempty"`
 }
 
 // Store aggregates usage records in memory and persists them periodically.
 type Store struct {
 	mu     sync.Mutex
 	months map[string]map[string]*Row
+	days   map[string]*Totals
 	labels map[string]string
 	path   string
 	dirty  bool
@@ -92,7 +116,7 @@ type Store struct {
 
 // New constructs an empty store.
 func New() *Store {
-	return &Store{months: make(map[string]map[string]*Row), labels: make(map[string]string), now: time.Now}
+	return &Store{months: make(map[string]map[string]*Row), days: make(map[string]*Totals), labels: make(map[string]string), now: time.Now}
 }
 
 // KeyID returns the identifier used for a client API key.
@@ -139,15 +163,17 @@ func (s *Store) Configure(cfg *config.Config) {
 		loaded, errLoad := loadState(path)
 		if errLoad != nil {
 			log.Warnf("usage-analytics: failed to load %s: %v", path, errLoad)
-			loaded = make(map[string]map[string]*Row)
+			loaded = stateFile{Months: make(map[string]map[string]*Row), Days: make(map[string]*Totals)}
 		}
 		s.mu.Lock()
 		if s.path == "" {
 			// Keep records that arrived before the first configuration.
-			mergeMonths(loaded, s.months)
+			mergeMonths(loaded.Months, s.months)
+			mergeDays(loaded.Days, s.days)
 		}
 		s.path = path
-		s.months = loaded
+		s.months = loaded.Months
+		s.days = loaded.Days
 		s.dirty = false
 		s.mu.Unlock()
 	}
@@ -228,11 +254,19 @@ func (s *Store) HandleUsage(_ context.Context, record coreusage.Record) {
 	row.OutputTokens += t.Output
 	row.ReasoningTokens += t.Reasoning
 	row.TotalTokens += t.Total
+	costUSD, unpriced := 0.0, int64(0)
 	if priced {
-		row.CostUSD += cost(price, t, fast)
+		costUSD = cost(price, t, fast)
 	} else {
-		row.UnpricedTokens += t.Total
+		unpriced = t.Total
 	}
+	row.CostUSD += costUSD
+	row.UnpricedTokens += unpriced
+	day := at.UTC().Format("2006-01-02")
+	if s.days[day] == nil {
+		s.days[day] = &Totals{Period: day}
+	}
+	s.days[day].add(1, t.Total, costUSD, unpriced)
 	s.dirty = true
 }
 
@@ -247,6 +281,11 @@ func (s *Store) pruneLocked() {
 	sort.Strings(months)
 	for _, month := range months[:len(months)-retainedMonths] {
 		delete(s.months, month)
+	}
+	for day := range s.days {
+		if _, ok := s.months[day[:7]]; !ok {
+			delete(s.days, day)
+		}
 	}
 }
 
@@ -267,6 +306,21 @@ func (s *Store) Report(month string) Report {
 		report.Rows = append(report.Rows, *row)
 	}
 	sort.Slice(report.Rows, func(i, j int) bool { return report.Rows[i].CostUSD > report.Rows[j].CostUSD })
+	report.Days = []Totals{}
+	for day, totals := range s.days {
+		if strings.HasPrefix(day, month+"-") {
+			report.Days = append(report.Days, *totals)
+		}
+	}
+	sort.Slice(report.Days, func(i, j int) bool { return report.Days[i].Period < report.Days[j].Period })
+	report.Trend = make([]Totals, 0, len(report.Months))
+	for i := len(report.Months) - 1; i >= 0; i-- {
+		totals := Totals{Period: report.Months[i]}
+		for _, row := range s.months[report.Months[i]] {
+			totals.add(row.Requests, row.TotalTokens, row.CostUSD, row.UnpricedTokens)
+		}
+		report.Trend = append(report.Trend, totals)
+	}
 	for id, label := range s.labels {
 		report.Keys[id] = label
 	}
@@ -283,7 +337,7 @@ func (s *Store) Flush() {
 		s.mu.Unlock()
 		return
 	}
-	data, errMarshal := json.Marshal(stateFile{Version: 1, Months: s.months})
+	data, errMarshal := json.Marshal(stateFile{Version: 1, Months: s.months, Days: s.days})
 	path := s.path
 	s.dirty = false
 	s.mu.Unlock()
@@ -308,22 +362,33 @@ func (s *Store) Flush() {
 	}
 }
 
-func loadState(path string) (map[string]map[string]*Row, error) {
+func loadState(path string) (stateFile, error) {
+	state := stateFile{}
 	data, errRead := os.ReadFile(path)
-	if errRead != nil {
-		if errors.Is(errRead, os.ErrNotExist) {
-			return make(map[string]map[string]*Row), nil
-		}
-		return nil, errRead
+	if errRead != nil && !errors.Is(errRead, os.ErrNotExist) {
+		return state, errRead
 	}
-	var state stateFile
-	if errUnmarshal := json.Unmarshal(data, &state); errUnmarshal != nil {
-		return nil, errUnmarshal
+	if errRead == nil {
+		if errUnmarshal := json.Unmarshal(data, &state); errUnmarshal != nil {
+			return state, errUnmarshal
+		}
 	}
 	if state.Months == nil {
 		state.Months = make(map[string]map[string]*Row)
 	}
-	return state.Months, nil
+	if state.Days == nil {
+		state.Days = make(map[string]*Totals)
+	}
+	return state, nil
+}
+
+func mergeDays(dst, src map[string]*Totals) {
+	for day, totals := range src {
+		if dst[day] == nil {
+			dst[day] = &Totals{Period: day}
+		}
+		dst[day].add(totals.Requests, totals.TotalTokens, totals.CostUSD, totals.UnpricedTokens)
+	}
 }
 
 func mergeMonths(dst, src map[string]map[string]*Row) {

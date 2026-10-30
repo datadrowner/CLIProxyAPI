@@ -202,10 +202,10 @@ index b4bc63b..d2e46b0 100644
  }
 diff --git a/internal/cliproxy/limits.go b/internal/cliproxy/limits.go
 new file mode 100644
-index 0000000..fd3e25f
+index 0000000..2430eaa
 --- /dev/null
 +++ b/internal/cliproxy/limits.go
-@@ -0,0 +1,208 @@
+@@ -0,0 +1,226 @@
 +package cliproxy
 +
 +import (
@@ -335,6 +335,18 @@ index 0000000..fd3e25f
 +	Keys          map[string]string `json:"keys"`
 +	Pricing       []Price           `json:"pricing"`
 +	PricingSource string            `json:"pricing_source"`
++	// Days lists the recorded days of the month; Trend lists every retained month, oldest first.
++	Days  []Totals `json:"days"`
++	Trend []Totals `json:"trend"`
++}
++
++// Totals is the usage of one day ("YYYY-MM-DD") or month ("YYYY-MM").
++type Totals struct {
++	Period         string  `json:"period"`
++	Requests       int64   `json:"requests"`
++	TotalTokens    int64   `json:"total_tokens"`
++	CostUSD        float64 `json:"cost_usd"`
++	UnpricedTokens int64   `json:"unpriced_tokens"`
 +}
 +
 +// QuotaWindow is a provider-reported subscription limit window of an account.
@@ -411,6 +423,12 @@ index 0000000..fd3e25f
 +	}
 +	if out.Months == nil {
 +		out.Months = []string{}
++	}
++	if out.Days == nil {
++		out.Days = []Totals{}
++	}
++	if out.Trend == nil {
++		out.Trend = []Totals{}
 +	}
 +	return out, nil
 +}
@@ -560,7 +578,7 @@ index 0000000..95a1abf
 +	}
 +}
 diff --git a/internal/mock/mock.go b/internal/mock/mock.go
-index db0af38..3eba8ac 100644
+index db0af38..2ed2142 100644
 --- a/internal/mock/mock.go
 +++ b/internal/mock/mock.go
 @@ -2,7 +2,10 @@
@@ -605,7 +623,7 @@ index db0af38..3eba8ac 100644
  			}
  			send(map[string]any{"files": files})
  		case "/v8/management/credentials/models":
-@@ -108,6 +126,66 @@ func (s *Server) Handler() http.Handler {
+@@ -108,6 +126,68 @@ func (s *Server) Handler() http.Handler {
  			send(map[string]bool{"ok": true})
  		case "/v8/management/observability/logs":
  			send(map[string]any{"lines": []string{"INFO mock started", "ERROR Authorization: Bearer MUST-NOT-LEAK"}})
@@ -668,6 +686,8 @@ index db0af38..3eba8ac 100644
 +				"rows":    []any{map[string]any{"key_id": keyID(s.Key), "auth_index": "mock-index", "provider": "claude", "model": "claude-opus-5-5", "requests": 3, "input_tokens": 1000000, "total_tokens": 1000000, "cost_usd": 4.0}},
 +				"keys":    map[string]string{keyID(s.Key): "mock...only"},
 +				"pricing": []any{map[string]any{"model": "claude-opus-5-5", "name": "Claude Opus 5.5", "input": 4, "output": 20}}, "pricing_source": "mock",
++				"days":  []any{map[string]any{"period": "2026-10-03", "requests": 2, "total_tokens": 600000, "cost_usd": 2.4}, map[string]any{"period": "2026-10-07", "requests": 1, "total_tokens": 400000, "cost_usd": 1.6}},
++				"trend": []any{map[string]any{"period": "2026-09", "requests": 5, "total_tokens": 2000000, "cost_usd": 8.0}, map[string]any{"period": "2026-10", "requests": 3, "total_tokens": 1000000, "cost_usd": 4.0}},
 +			})
  		default:
  			w.WriteHeader(404)
@@ -1736,7 +1756,7 @@ index d664300..59f5f3a 100644
  document.querySelectorAll('.copy-url').forEach(b => b.addEventListener('click', action(() => copy(baseURL))));
  document.querySelectorAll('.copy-key').forEach(b => b.addEventListener('click', action(async () => { const d = await api('key'); await copy(d.key); })));
 diff --git a/web/static/index.html b/web/static/index.html
-index d6488c6..0946836 100644
+index d6488c6..ba83bf0 100644
 --- a/web/static/index.html
 +++ b/web/static/index.html
 @@ -1,11 +1,11 @@
@@ -1754,13 +1774,13 @@ index d6488c6..0946836 100644
 +<section id="providers" class="page" hidden><p class="eyebrow">MAKE A CONNECTION</p><h1>Your providers.</h1><div id="provider-cards" class="grid"></div><article id="flow" hidden><h2 id="flow-title">Connect provider</h2><p id="flow-status">Waiting for authentication</p><a id="auth-link" target="_blank" rel="noopener noreferrer">Open provider sign-in ↗</a><p id="device-code"></p><button id="cancel-flow">Cancel login</button><form id="callback-form"><label for="callback">Authentication finished but the localhost callback could not reach the server. Copy the complete URL from your browser address bar and paste it here.</label><input id="callback" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:1455/auth/callback?…"><button type="submit">Complete connection</button></form></article><article id="paste-callback"><h2>Paste a callback URL</h2><p>Signed in on another computer and the browser ended on a localhost page that could not load? Click Connect first, sign in, then copy the complete URL from the browser address bar and paste it here. This works even after reloading this page, within 5 minutes of clicking Connect.</p><form id="paste-callback-form"><label for="paste-callback-url">Callback URL</label><input id="paste-callback-url" type="text" autocomplete="off" spellcheck="false" maxlength="8192" placeholder="http://localhost:54545/callback?code=…&amp;state=…"><button type="submit">Submit callback URL</button></form></article><h2>Connected accounts</h2><div id="accounts"></div></section>
  <section id="access" class="page" hidden><p class="eyebrow">PLUG INTO YOUR TOOLS</p><h1>API Access.</h1><article><h2>Base URL</h2><code class="base-url"></code><button class="copy-url">Copy Base URL</button><h2>API key</h2><code class="key-hint"></code><button class="copy-key">Copy API Key</button><p>Use this URL and key in an OpenAI-compatible client. Choose a model shown on Overview.</p><hr><p>Existing clients using this key will stop working after key regeneration.</p><button id="rotate" class="danger">Regenerate API Key</button></article></section>
 -<section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
-+<section id="keys" class="page" hidden><p class="eyebrow">SHARE ACCESS SAFELY</p><h1>API keys.</h1><p>Create a key for each person or tool. A key can have full usage, a token budget, a share of each connected subscription account, or follow a subscription plan, and can be limited to certain models and reasoning efforts. Changes apply immediately; a key that used up its budget or share gets HTTP 429 until it resets.</p><article><h2 id="key-form-title">Create a key</h2><form id="key-form"><input id="key-id" type="hidden"><label for="key-name">Name</label><input id="key-name" maxlength="64" placeholder="e.g. Laptop, Alice, CI"><label for="key-mode">Limit</label><select id="key-mode"><option value="full">Full usage (no limit)</option><option value="tokens">Token budget</option><option value="share">Share of each subscription account</option><option value="plan">Subscription plan</option></select><div id="key-tokens-fields" hidden><label for="key-limit">Tokens</label><input id="key-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="key-period">Resets</label><select id="key-period" class="period"><option value="total">Never (one-off budget)</option><option value="daily">Daily (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="monthly">Monthly (UTC)</option><option value="custom">Custom window…</option></select><input id="key-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="key-plan-fields" hidden><label for="key-plan">Plan</label><select id="key-plan"></select><p id="key-plan-empty" hidden>No plans yet. Add one under Subscription plans below.</p></div><div id="key-share-fields" hidden><label for="key-share">Percent of each connected subscription account</label><input id="key-share" type="number" min="0.1" max="100" step="0.1" placeholder="e.g. 10"><p class="field-hint">Every request goes through this proxy, so it estimates each key's part of every connected account's own limit windows (for example Claude's 5-hour and 7-day windows) from the cost each key sent through that account. The key is paused once its part of any window reaches this percentage and resumes when that window resets.</p></div><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models this key may use; nothing ticked allows every model. Other models are rejected and hidden from its model list. A key on a plan uses the plan's models and efforts unless you tick some here.</p><div class="picker-tools"><input id="key-models-filter" type="search" placeholder="Filter, e.g. opus" aria-label="Filter models"><button type="button" id="key-models-all">Tick shown</button><button type="button" id="key-models-none">Clear</button></div><div id="key-models" class="choices list" role="group" aria-label="Models"></div><small id="key-models-count"></small><label for="key-models-extra">More models or patterns</label><input id="key-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts this key may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="key-efforts" class="choices"></div></fieldset><button type="submit" id="key-submit">Create key</button><button type="button" id="key-cancel" hidden>Cancel</button></form><div id="key-created" hidden><p>New key created. Copy it now and store it safely; you can copy it again later from the list.</p><code id="key-created-value"></code><button id="key-created-copy">Copy key</button></div></article><h2>Your keys</h2><div id="key-list" class="grid"></div><article><h2>Subscription plans</h2><p>Plans are reusable limits, for example "Starter: 1M tokens per month, Sonnet only". Adding a plan with an existing name replaces it. Keys on a plan follow it; changing a plan updates every key on it.</p><div id="plan-list" class="usage-list"></div><form id="plan-form"><h3>Add a plan</h3><label for="plan-name">Plan name</label><input id="plan-name" maxlength="40" placeholder="e.g. starter"><label for="plan-mode">Limit</label><select id="plan-mode"><option value="tokens">Token budget</option><option value="share">Share of each subscription account</option><option value="full">No usage limit (models and efforts only)</option></select><div id="plan-tokens-fields"><label for="plan-limit">Tokens</label><input id="plan-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="plan-period">Resets</label><select id="plan-period" class="period"><option value="monthly">Monthly (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="daily">Daily (UTC)</option><option value="total">Never (one-off budget)</option><option value="custom">Custom window…</option></select><input id="plan-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="plan-share-fields" hidden><label for="plan-share">Percent of each connected subscription account</label><input id="plan-share" type="number" min="0.1" max="100" step="0.1" placeholder="e.g. 10"><p class="field-hint">Every request goes through this proxy, so it estimates each key's part of every connected account's own limit windows (for example Claude's 5-hour and 7-day windows) from the cost each key sent through that account. Each key on the plan is paused once its part of any window reaches this percentage and resumes when that window resets.</p></div><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models keys on this plan may use; nothing ticked allows every model. Other models are rejected and hidden from its model list.</p><div class="picker-tools"><input id="plan-models-filter" type="search" placeholder="Filter, e.g. opus" aria-label="Filter models"><button type="button" id="plan-models-all">Tick shown</button><button type="button" id="plan-models-none">Clear</button></div><div id="plan-models" class="choices list" role="group" aria-label="Models"></div><small id="plan-models-count"></small><label for="plan-models-extra">More models or patterns</label><input id="plan-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts keys on this plan may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="plan-efforts" class="choices"></div></fieldset><button type="submit">Add plan</button></form></article></section><section id="analytics" class="page" hidden><p class="eyebrow">WHAT IT WOULD COST</p><h1>Analytics.</h1><p>Tokens of all calls through this proxy and what they would cost at Anthropic API list prices, per month. Models without a known Anthropic price (for example OpenAI models) show tokens only. Cache writes are priced at the 5-minute rate.</p><label for="analytics-month">Month</label><select id="analytics-month"></select><div id="analytics-totals" class="grid"></div><article><h2>Per API key</h2><div class="table-wrap"><table id="analytics-keys"></table></div></article><article><h2>Per model</h2><div class="table-wrap"><table id="analytics-models"></table></div></article><article><h2>Per connected account</h2><div class="table-wrap"><table id="analytics-accounts"></table></div></article><details><summary>Anthropic API price table (USD per million tokens)</summary><p id="pricing-source"></p><div class="table-wrap"><table id="analytics-pricing"></table></div></details></section><section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
++<section id="keys" class="page" hidden><p class="eyebrow">SHARE ACCESS SAFELY</p><h1>API keys.</h1><p>Create a key for each person or tool. A key can have full usage, a token budget, a share of each connected subscription account, or follow a subscription plan, and can be limited to certain models and reasoning efforts. Changes apply immediately; a key that used up its budget or share gets HTTP 429 until it resets.</p><article><h2 id="key-form-title">Create a key</h2><form id="key-form"><input id="key-id" type="hidden"><label for="key-name">Name</label><input id="key-name" maxlength="64" placeholder="e.g. Laptop, Alice, CI"><label for="key-mode">Limit</label><select id="key-mode"><option value="full">Full usage (no limit)</option><option value="tokens">Token budget</option><option value="share">Share of each subscription account</option><option value="plan">Subscription plan</option></select><div id="key-tokens-fields" hidden><label for="key-limit">Tokens</label><input id="key-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="key-period">Resets</label><select id="key-period" class="period"><option value="total">Never (one-off budget)</option><option value="daily">Daily (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="monthly">Monthly (UTC)</option><option value="custom">Custom window…</option></select><input id="key-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="key-plan-fields" hidden><label for="key-plan">Plan</label><select id="key-plan"></select><p id="key-plan-empty" hidden>No plans yet. Add one under Subscription plans below.</p></div><div id="key-share-fields" hidden><label for="key-share">Percent of each connected subscription account</label><input id="key-share" type="number" min="0.1" max="100" step="0.1" placeholder="e.g. 10"><p class="field-hint">Every request goes through this proxy, so it estimates each key's part of every connected account's own limit windows (for example Claude's 5-hour and 7-day windows) from the cost each key sent through that account. The key is paused once its part of any window reaches this percentage and resumes when that window resets.</p></div><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models this key may use; nothing ticked allows every model. Other models are rejected and hidden from its model list. A key on a plan uses the plan's models and efforts unless you tick some here.</p><div class="picker-tools"><input id="key-models-filter" type="search" placeholder="Filter, e.g. opus" aria-label="Filter models"><button type="button" id="key-models-all">Tick shown</button><button type="button" id="key-models-none">Clear</button></div><div id="key-models" class="choices list" role="group" aria-label="Models"></div><small id="key-models-count"></small><label for="key-models-extra">More models or patterns</label><input id="key-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts this key may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="key-efforts" class="choices"></div></fieldset><button type="submit" id="key-submit">Create key</button><button type="button" id="key-cancel" hidden>Cancel</button></form><div id="key-created" hidden><p>New key created. Copy it now and store it safely; you can copy it again later from the list.</p><code id="key-created-value"></code><button id="key-created-copy">Copy key</button></div></article><h2>Your keys</h2><div id="key-list" class="grid"></div><article><h2>Subscription plans</h2><p>Plans are reusable limits, for example "Starter: 1M tokens per month, Sonnet only". Adding a plan with an existing name replaces it. Keys on a plan follow it; changing a plan updates every key on it.</p><div id="plan-list" class="usage-list"></div><form id="plan-form"><h3>Add a plan</h3><label for="plan-name">Plan name</label><input id="plan-name" maxlength="40" placeholder="e.g. starter"><label for="plan-mode">Limit</label><select id="plan-mode"><option value="tokens">Token budget</option><option value="share">Share of each subscription account</option><option value="full">No usage limit (models and efforts only)</option></select><div id="plan-tokens-fields"><label for="plan-limit">Tokens</label><input id="plan-limit" type="number" min="1" step="1" placeholder="e.g. 1000000"><label for="plan-period">Resets</label><select id="plan-period" class="period"><option value="monthly">Monthly (UTC)</option><option value="weekly">Weekly (Monday, UTC)</option><option value="daily">Daily (UTC)</option><option value="total">Never (one-off budget)</option><option value="custom">Custom window…</option></select><input id="plan-period-custom" class="period-custom" placeholder="Window length, e.g. 5h or 168h" hidden></div><div id="plan-share-fields" hidden><label for="plan-share">Percent of each connected subscription account</label><input id="plan-share" type="number" min="0.1" max="100" step="0.1" placeholder="e.g. 10"><p class="field-hint">Every request goes through this proxy, so it estimates each key's part of every connected account's own limit windows (for example Claude's 5-hour and 7-day windows) from the cost each key sent through that account. Each key on the plan is paused once its part of any window reaches this percentage and resumes when that window resets.</p></div><fieldset><legend>Models (optional)</legend><p class="field-hint">Tick the models keys on this plan may use; nothing ticked allows every model. Other models are rejected and hidden from its model list.</p><div class="picker-tools"><input id="plan-models-filter" type="search" placeholder="Filter, e.g. opus" aria-label="Filter models"><button type="button" id="plan-models-all">Tick shown</button><button type="button" id="plan-models-none">Clear</button></div><div id="plan-models" class="choices list" role="group" aria-label="Models"></div><small id="plan-models-count"></small><label for="plan-models-extra">More models or patterns</label><input id="plan-models-extra" maxlength="2000" placeholder="Comma-separated, * matches anything, e.g. claude-sonnet-*"></fieldset><fieldset><legend>Reasoning efforts (optional)</legend><p class="field-hint">Tick the efforts keys on this plan may request; nothing ticked allows every effort. Requests that set no effort use the model's default.</p><div id="plan-efforts" class="choices"></div></fieldset><button type="submit">Add plan</button></form></article></section><section id="analytics" class="page" hidden><p class="eyebrow">WHAT IT WOULD COST</p><h1>Analytics.</h1><p>Tokens of all calls through this proxy and what they would cost at Anthropic API list prices, per month. Models without a known Anthropic price (for example OpenAI models) show tokens only. Cache writes are priced at the 5-minute rate.</p><label for="analytics-month">Month</label><select id="analytics-month"></select><div id="analytics-totals" class="grid"></div><div class="chart-controls" role="radiogroup" aria-label="Measure shown in the charts"><span>Charts show</span><label><input type="radio" name="chart-measure" value="cost" checked> API cost</label><label><input type="radio" name="chart-measure" value="tokens"> Tokens</label><small>Cost is known for Anthropic models only; choose Tokens to include all models.</small></div><article><h2>Per day</h2><p class="field-hint" id="chart-days-note"></p><div id="chart-days" class="chart"></div></article><article><h2>Per month</h2><p class="field-hint">The selected month is highlighted. Click a month to open it.</p><div id="chart-months" class="chart"></div></article><div class="grid"><article><h2>By API key</h2><div id="chart-keys" class="bar-list"></div></article><article><h2>By model</h2><div id="chart-models" class="bar-list"></div></article><article><h2>By account</h2><div id="chart-accounts" class="bar-list"></div></article></div><div id="chart-tip" role="tooltip" hidden></div><article><h2>Per API key</h2><div class="table-wrap"><table id="analytics-keys"></table></div></article><article><h2>Per model</h2><div class="table-wrap"><table id="analytics-models"></table></div></article><article><h2>Per connected account</h2><div class="table-wrap"><table id="analytics-accounts"></table></div></article><details><summary>Anthropic API price table (USD per million tokens)</summary><p id="pricing-source"></p><div class="table-wrap"><table id="analytics-pricing"></table></div></details></section><section id="logs" class="page" hidden><p class="eyebrow">SERVICE ACTIVITY</p><h1>Logs.</h1><p>Recent event severities from CLIProxyAPI. Message contents are withheld because upstream logs can contain credentials and OAuth codes.</p><button id="refresh-logs">Refresh Logs</button><pre id="log-lines"></pre></section></div>
  </main><footer>CLIProxyAPI is a third-party project. Provider availability and authentication methods are controlled by their respective services.</footer></body></html>
 diff --git a/web/static/style.css b/web/static/style.css
-index 614cbbf..9ad35a1 100644
+index 614cbbf..0f7f77a 100644
 --- a/web/static/style.css
 +++ b/web/static/style.css
-@@ -1 +1,35 @@
+@@ -1 +1,62 @@
  :root{font-family:system-ui,-apple-system,sans-serif;color:#e6ebf1;background:#10151c;font-size:16px;color-scheme:dark}*{box-sizing:border-box}body{margin:0}header{display:flex;align-items:center;gap:16px;border-bottom:1px solid #2a333f;padding:24px 6vw}header strong{font-size:20px}small{display:block;color:#9babbc;margin-top:5px}.mark{border:1px solid #64748b;border-radius:12px;padding:10px;font-weight:800}.mark span{color:#9de4b7}#logout{margin-left:auto}main{max-width:1100px;margin:0 auto;padding:35px 24px 70px}h1{font-size:clamp(32px,5vw,52px);letter-spacing:-.045em;line-height:1.15;margin:16px 0 32px}h2{font-size:19px;margin-top:0}h3{margin-top:0}.eyebrow{font-size:12px;color:#9de4b7;letter-spacing:.16em;font-weight:700}p{line-height:1.6;color:#b4c1cf}article{background:#19212c;border:1px solid #303c4c;border-radius:14px;padding:25px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:18px}.grid article{margin:0}button,a{cursor:pointer}button{font:inherit;border:1px solid #45556a;border-radius:7px;padding:10px 15px;background:#27384b;color:#eef5fa;margin:10px 10px 0 0}button:hover{background:#354b61}button:focus-visible,input:focus-visible,a:focus-visible{outline:2px solid #9de4b7;outline-offset:4px}button:disabled{opacity:.5;cursor:wait}a{color:#9de4b7}nav{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:40px}nav button{background:transparent;border-color:transparent}nav .selected{background:#254333;color:#bbf4cf}.danger{border-color:#925654;color:#ffb4ab}label{display:block;line-height:1.6;margin:16px 0 8px}input{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}#login{max-width:620px;margin:35px auto}#login-form{max-width:420px}code{display:block;overflow-wrap:anywhere;color:#b8e3f6;font-size:15px;margin:15px 0}#notice:empty{display:none}#notice{padding:14px;border-left:3px solid #9de4b7;background:#1a3028;margin-bottom:24px}li{padding:8px;border-bottom:1px solid #303c4c}ul{padding-left:20px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.7}footer{border-top:1px solid #2a333f;color:#8292a4;text-align:center;font-size:12px;padding:24px}hr{border:0;border-top:1px solid #354253;margin:30px 0}[hidden]{display:none!important}@media(max-width:600px){header{padding:20px}main{padding:24px 16px}article{padding:20px}nav{gap:0}nav button{padding:9px}h1{margin-bottom:24px}}
 +select{width:100%;padding:13px;border:1px solid #53627a;border-radius:7px;background:#10151c;color:#fff;font:inherit}
 +meter{display:block;width:100%;height:12px;margin:8px 0}
@@ -1796,12 +1816,39 @@ index 614cbbf..9ad35a1 100644
 +.choices.list{display:block;max-height:240px;overflow-y:auto;border:1px solid #303c4c;border-radius:7px;padding:2px 12px;background:#10151c}
 +.choices.list label{margin:0;padding:7px 0;border-bottom:1px solid #222b37}
 +.choices.list label:last-child{border-bottom:0}
++.chart-controls{display:flex;gap:10px 20px;align-items:center;flex-wrap:wrap;margin:28px 0 0}
++.chart-controls>span{color:#b4c1cf}
++.chart-controls label{display:flex;gap:8px;align-items:center;margin:0;cursor:pointer}
++.chart-controls input{width:auto;margin:0}
++.chart-controls small{flex-basis:100%;margin:0}
++.chart{width:100%;overflow:hidden}
++.chart svg{display:block}
++.chart .grid{stroke:#2a333f;stroke-width:1}
++.chart .axis{stroke:#45556a;stroke-width:1}
++.chart .tick{fill:#9babbc;font-size:11px;font-variant-numeric:tabular-nums}
++.chart .value{fill:#e6ebf1;font-size:12px;font-weight:600}
++.chart .hit{outline:none}
++.chart .hit.clickable{cursor:pointer}
++.chart .col:hover .mark,.chart .col:focus-within .mark{filter:brightness(1.3)}
++.chart .col:focus-within .hit{stroke:#9de4b7;stroke-width:1}
++.bar-list{display:grid;gap:12px}
++.bar-row{border-radius:6px;cursor:default}
++.bar-row:focus-visible{outline:2px solid #9de4b7;outline-offset:4px}
++.bar-head{display:flex;justify-content:space-between;gap:12px;font-size:14px}
++.bar-head span:first-child{color:#b4c1cf;overflow-wrap:anywhere}
++.bar-head span:last-child{color:#e6ebf1;white-space:nowrap;font-variant-numeric:tabular-nums}
++.bar-track{height:10px;margin-top:6px}
++.bar{height:10px;min-width:2px;background:#3987e5;border-radius:0 4px 4px 0}
++.bar-row:hover .bar,.bar-row:focus .bar{filter:brightness(1.3)}
++#chart-tip{position:fixed;z-index:10;pointer-events:none;background:#0d1219;border:1px solid #45556a;border-radius:8px;padding:8px 11px;max-width:280px;box-shadow:0 6px 18px rgba(0,0,0,.45)}
++#chart-tip strong{display:block;color:#e6ebf1;font-variant-numeric:tabular-nums}
++#chart-tip small{margin-top:3px}
 diff --git a/web/static/usage.js b/web/static/usage.js
 new file mode 100644
-index 0000000..1bbc572
+index 0000000..aeba6a0
 --- /dev/null
 +++ b/web/static/usage.js
-@@ -0,0 +1,298 @@
+@@ -0,0 +1,427 @@
 +'use strict';
 +// API keys, usage overview and analytics. Uses helpers from app.js.
 +const fmtInt = new Intl.NumberFormat();
@@ -2049,10 +2096,139 @@ index 0000000..1bbc572
 +  table('analytics-keys', groupHeaders('API key'), group(rows, r => r.key_id).map(([id, g]) => groupRow(keyLabel(id), g)));
 +  table('analytics-models', groupHeaders('Model'), group(rows, r => r.model).map(([m, g]) => groupRow(m, g)));
 +  table('analytics-accounts', groupHeaders('Account'), group(rows, r => r.auth_index).map(([idx, g]) => groupRow(d.accounts[idx] || (idx ? 'Removed account' : 'Unknown'), g)));
++  chartData = {a, keyLabel, accountLabel: idx => d.accounts[idx] || (idx ? 'Removed account' : 'Unknown')};
++  renderCharts();
 +  $('pricing-source').textContent = a.pricing_source;
 +  table('analytics-pricing', ['Model', 'ID prefix', 'Input', 'Cache write 5m', 'Cache write 1h', 'Cache read', 'Output'],
 +    a.pricing.map(p => [p.name + (p.legacy ? ' (legacy)' : '') + (p.long_prompt ? ' (≤' + fmtInt.format(p.long_prompt_threshold) + ' prompt; above: $' + p.long_prompt.input + ' / $' + p.long_prompt.output + ')' : '') + (p.fast_mode ? ' · fast mode 2×' : ''), p.model, '$' + p.input, '$' + p.cache_write_5m, '$' + p.cache_write_1h, '$' + p.cache_read, '$' + p.output]));
 +}
++// ---- Analytics charts ----
++// One hue for magnitude (accent), a gray for context; both validated against the card surface.
++const chartColors = {accent: '#3987e5', muted: '#71706b'};
++const compactNum = new Intl.NumberFormat(undefined, {notation: 'compact', maximumFractionDigits: 2});
++const compactUSD = new Intl.NumberFormat(undefined, {style: 'currency', currency: 'USD', notation: 'compact', maximumFractionDigits: 2});
++let chartData = null;
++const chartMeasure = () => document.querySelector('input[name=chart-measure]:checked').value;
++const measureOf = t => chartMeasure() === 'cost' ? (t.cost_usd || 0) : (t.total_tokens || 0);
++const measureText = v => chartMeasure() === 'cost' ? usdText(v) : tokensText(v) + ' tokens';
++const axisText = v => chartMeasure() === 'cost' ? compactUSD.format(v) : compactNum.format(v);
++const otherText = t => chartMeasure() === 'cost' ? tokensText(t.total_tokens) + ' tokens' : usdText(t.cost_usd);
++function niceMax(v) {
++  if (!(v > 0)) return 1;
++  const p = Math.pow(10, Math.floor(Math.log10(v))), n = v / p;
++  return (n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10) * p;
++}
++function showTip(event, lines) {
++  const t = $('chart-tip');
++  t.replaceChildren(...lines.map((line, i) => element(i ? 'small' : 'strong', line)));
++  t.hidden = false;
++  const r = event.currentTarget.getBoundingClientRect();
++  const x = event.clientX || r.left + r.width / 2, y = event.clientY || r.top;
++  t.style.left = Math.max(8, Math.min(x + 14, window.innerWidth - t.offsetWidth - 8)) + 'px';
++  t.style.top = Math.max(8, y - t.offsetHeight - 12) + 'px';
++}
++const hideTip = () => { $('chart-tip').hidden = true; };
++function withTip(node, lines) {
++  node.addEventListener('pointermove', e => showTip(e, lines)); node.addEventListener('pointerleave', hideTip);
++  node.addEventListener('focus', e => showTip(e, lines)); node.addEventListener('blur', hideTip);
++}
++const svgNS = 'http://www.w3.org/2000/svg';
++function svgEl(tag, attrs, parent) {
++  const e = document.createElementNS(svgNS, tag);
++  Object.entries(attrs).forEach(([k, v]) => e.setAttribute(k, v));
++  if (parent) parent.append(e);
++  return e;
++}
++// Columns from one baseline: 24px max width, 4px rounded top, hover/focus tooltip per column,
++// and only the highest column labeled.
++function columnChart(box, items, title) {
++  const width = Math.max(box.clientWidth, 280), height = 210, left = 54, right = 8, top = 22, bottom = 26;
++  const plotW = width - left - right, plotH = height - top - bottom, band = plotW / Math.max(items.length, 1);
++  const barW = Math.min(24, Math.max(2, band * 0.7)), max = niceMax(Math.max(0, ...items.map(i => i.value)));
++  const s = svgEl('svg', {viewBox: '0 0 ' + width + ' ' + height, width, height, role: 'img', 'aria-label': title});
++  [0, 0.5, 1].forEach(f => {
++    const y = top + plotH * (1 - f);
++    svgEl('line', {x1: left, x2: width - right, y1: y, y2: y, class: f === 0 ? 'axis' : 'grid'}, s);
++    svgEl('text', {x: left - 8, y: y + 4, 'text-anchor': 'end', class: 'tick'}, s).textContent = axisText(max * f);
++  });
++  let peak = -1;
++  items.forEach((it, i) => { if (it.value > 0 && (peak < 0 || it.value > items[peak].value)) peak = i; });
++  // When every column is labeled and the labels do not fit, keep every n-th one, counted from the newest.
++  const longest = Math.max(0, ...items.map(it => (it.axisLabel || '').length));
++  const step = items.every(it => it.axisLabel) ? Math.max(1, Math.ceil((longest * 6.5 + 8) / band)) : 1;
++  items.forEach((it, i) => {
++    const g = svgEl('g', {class: 'col'}, s), cx = left + band * (i + 0.5);
++    const h = it.value > 0 ? Math.max(2, plotH * it.value / max) : 0, x = cx - barW / 2, y = top + plotH - h;
++    if (h > 0) {
++      const r = Math.min(4, barW / 2, h);
++      svgEl('path', {d: 'M' + x + ',' + (y + h) + 'V' + (y + r) + 'Q' + x + ',' + y + ' ' + (x + r) + ',' + y + 'H' + (x + barW - r) + 'Q' + (x + barW) + ',' + y + ' ' + (x + barW) + ',' + (y + r) + 'V' + (y + h) + 'Z', fill: it.muted ? chartColors.muted : chartColors.accent, class: 'mark'}, g);
++    }
++    if (i === peak) svgEl('text', {x: cx, y: y - 6, 'text-anchor': 'middle', class: 'value'}, g).textContent = axisText(it.value);
++    if (it.axisLabel && (items.length - 1 - i) % step === 0) svgEl('text', {x: cx, y: height - 8, 'text-anchor': 'middle', class: 'tick'}, g).textContent = it.axisLabel;
++    const hit = svgEl('rect', {x: left + band * i, y: top, width: band, height: plotH, fill: 'transparent', tabindex: 0, 'aria-label': it.tip.join(', '), class: 'hit' + (it.onClick ? ' clickable' : '')}, g);
++    withTip(hit, it.tip);
++    if (it.onClick) {
++      hit.addEventListener('click', it.onClick);
++      hit.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); it.onClick(); } });
++    }
++  });
++  box.replaceChildren(s);
++}
++// Horizontal bars sorted by size; the tail past seven entries folds into "Other".
++function barList(box, groups) {
++  let items = groups.map(([label, t]) => ({label, value: measureOf(t), t})).sort((x, y) => y.value - x.value || y.t.total_tokens - x.t.total_tokens);
++  if (items.length > 8) {
++    const rest = items.slice(7), t = {requests: 0, total_tokens: 0, cost_usd: 0};
++    rest.forEach(i => { t.requests += i.t.requests; t.total_tokens += i.t.total_tokens; t.cost_usd += i.t.cost_usd; });
++    items = items.slice(0, 7).concat([{label: 'Other (' + rest.length + ')', value: measureOf(t), t}]);
++  }
++  const max = Math.max(0, ...items.map(i => i.value)) || 1;
++  box.replaceChildren(...(items.length ? items.map(it => {
++    const row = element('div', ''), head = element('div', ''), track = element('div', ''), bar = element('div', '');
++    row.className = 'bar-row'; row.tabIndex = 0; head.className = 'bar-head'; track.className = 'bar-track'; bar.className = 'bar';
++    head.append(element('span', it.label), element('span', measureText(it.value)));
++    bar.style.width = (it.value / max * 100) + '%'; if (!it.value) bar.hidden = true;
++    track.append(bar); row.append(head, track);
++    withTip(row, [measureText(it.value), it.label, fmtInt.format(it.t.requests) + ' requests · ' + otherText(it.t)]);
++    return row;
++  }) : [element('p', 'No usage recorded.')]));
++}
++function renderCharts() {
++  if (!chartData || $('analytics').hidden) return;
++  const {a, keyLabel, accountLabel} = chartData, utcDate = s => new Date(s + 'T00:00:00Z');
++  // Per day: every day of the month; days before daily totals were recorded show no column.
++  const [year, mon] = a.month.split('-').map(Number), count = new Date(Date.UTC(year, mon, 0)).getUTCDate();
++  const byDay = new Map(a.days.map(t => [t.period, t])), today = new Date().toISOString().slice(0, 10);
++  const monthTotal = a.trend.find(t => t.period === a.month) || {requests: 0};
++  const dayRequests = a.days.reduce((n, t) => n + t.requests, 0), first = a.days.length ? a.days[0].period : '';
++  const partial = monthTotal.requests > dayRequests;
++  const dayFmt = new Intl.DateTimeFormat(undefined, {day: 'numeric', month: 'short', timeZone: 'UTC'});
++  const days = [];
++  for (let d = 1; d <= count; d++) {
++    const date = a.month + '-' + String(d).padStart(2, '0'), t = byDay.get(date), label = dayFmt.format(utcDate(date));
++    let tip;
++    if (t) tip = [measureText(measureOf(t)), label, fmtInt.format(t.requests) + ' requests · ' + otherText(t)];
++    else if (date > today) tip = [label, 'Not reached yet'];
++    else if (partial && (!first || date < first)) tip = [label, 'Not recorded per day'];
++    else tip = ['No usage', label];
++    days.push({value: t ? measureOf(t) : 0, axisLabel: d === 1 || d % 5 === 0 ? String(d) : '', tip});
++  }
++  $('chart-days-note').textContent = partial ? (first ? 'Daily totals start on ' + dayFmt.format(utcDate(first)) + '; earlier usage this month appears only in the monthly totals.' : 'This month has no daily totals; they are recorded from the update that added these charts on.') : 'UTC days.';
++  columnChart($('chart-days'), days, 'Usage per day in ' + a.month);
++  // Per month: the selected month in the accent, the rest as gray context.
++  const monthFmt = new Intl.DateTimeFormat(undefined, {month: 'short', timeZone: 'UTC'}), longFmt = new Intl.DateTimeFormat(undefined, {month: 'long', year: 'numeric', timeZone: 'UTC'});
++  columnChart($('chart-months'), a.trend.map((t, i) => {
++    const date = utcDate(t.period + '-01'), label = monthFmt.format(date) + (i === 0 || t.period.endsWith('-01') ? ' ' + t.period.slice(2, 4) : '');
++    return {value: measureOf(t), muted: t.period !== a.month, axisLabel: label, tip: [measureText(measureOf(t)), longFmt.format(date), fmtInt.format(t.requests) + ' requests · ' + otherText(t)], onClick: t.period === a.month ? null : action(() => analytics(t.period))};
++  }), 'Usage per month');
++  const sum = keyFn => group(a.rows, keyFn).map(([k, g]) => [k, {requests: g.requests, total_tokens: g.total, cost_usd: g.cost}]);
++  barList($('chart-keys'), sum(r => r.key_id).map(([id, t]) => [keyLabel(id), t]));
++  barList($('chart-models'), sum(r => r.model));
++  barList($('chart-accounts'), sum(r => r.auth_index).map(([idx, t]) => [accountLabel(idx), t]));
++}
++document.querySelectorAll('input[name=chart-measure]').forEach(r => r.addEventListener('change', renderCharts));
++let chartResize = null;
++window.addEventListener('resize', () => { clearTimeout(chartResize); chartResize = setTimeout(renderCharts, 150); });
 +$('refresh-usage').addEventListener('click', action(async () => { await usageOverview(true); message('Usage refreshed.'); }));
 +$('analytics-month').addEventListener('change', action(() => analytics($('analytics-month').value)));
 +
