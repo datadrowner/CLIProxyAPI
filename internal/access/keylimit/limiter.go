@@ -25,7 +25,11 @@ import (
 )
 
 // DefaultStateFileName is the state file name used inside the auth directory.
-const DefaultStateFileName = "api-key-usage.json"
+// It must not end in .json: every *.json file there is loaded as a credential.
+const DefaultStateFileName = "api-key-usage.state"
+
+// legacyStateFileName is the previous default name; it is renamed on startup.
+const legacyStateFileName = "api-key-usage.json"
 
 func init() {
 	coreusage.RegisterNamedPlugin("api-key-limits", Default())
@@ -270,7 +274,9 @@ func resolveStatePath(cfg *config.Config) string {
 	if errResolve != nil || strings.TrimSpace(authDir) == "" {
 		authDir = "."
 	}
-	return filepath.Join(authDir, DefaultStateFileName)
+	path := filepath.Join(authDir, DefaultStateFileName)
+	util.MigrateStateFile(filepath.Join(authDir, legacyStateFileName), path)
+	return path
 }
 
 // Check reports the key's current status. tracked is false when the key is not

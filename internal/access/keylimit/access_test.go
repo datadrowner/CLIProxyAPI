@@ -1,6 +1,8 @@
 package keylimit
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -104,5 +106,31 @@ func TestMatchPattern(t *testing.T) {
 		if got := matchPattern(tc.pattern, tc.value); got != tc.want {
 			t.Errorf("matchPattern(%q, %q) = %v, want %v", tc.pattern, tc.value, got, tc.want)
 		}
+	}
+}
+
+func TestDefaultStateFileMovesOutOfCredentialNames(t *testing.T) {
+	authDir := t.TempDir()
+	keys := []config.APIKeyLimit{{Key: "budget", TokenLimit: 1000}}
+
+	// Write counters the way earlier versions did, to <auth-dir>/api-key-usage.json.
+	old, _ := newTestLimiter(t, config.APIKeyLimitsConfig{StateFile: filepath.Join(authDir, legacyStateFileName), Keys: keys}, time.Now())
+	charge(old, "budget", 300)
+	old.Flush()
+
+	cfg := &config.Config{}
+	cfg.AuthDir = authDir
+	cfg.APIKeyLimits = config.APIKeyLimitsConfig{Keys: keys}
+	l := New()
+	l.Configure(cfg)
+
+	if status, _, _ := l.Check("budget"); status.UsedTokens != 300 {
+		t.Fatalf("used tokens after migration = %d, want 300", status.UsedTokens)
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, legacyStateFileName)); !os.IsNotExist(errStat) {
+		t.Fatal("legacy .json state file is still in the auth directory")
+	}
+	if _, errStat := os.Stat(filepath.Join(authDir, DefaultStateFileName)); errStat != nil {
+		t.Fatalf("new state file missing: %v", errStat)
 	}
 }

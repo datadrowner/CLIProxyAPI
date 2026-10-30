@@ -92,7 +92,9 @@ keys:
 
 ## State
 
-Counters are written to `state-file` (default `<auth-dir>/api-key-usage.json`) after every usage record, so budgets survive restarts. The file stores SHA-256 digests of keys, never the keys themselves. Delete an entry, or the whole file while the server is stopped, to reset budgets. Changing a key's `period` starts a new window; changing its `token-limit` keeps the tokens already used. Config hot-reload applies changes without a restart.
+Counters are written to `state-file` (default `<auth-dir>/api-key-usage.state`) after every usage record, so budgets survive restarts. The file stores SHA-256 digests of keys, never the keys themselves. Delete an entry, or the whole file while the server is stopped, to reset budgets. Changing a key's `period` starts a new window; changing its `token-limit` keeps the tokens already used. Config hot-reload applies changes without a restart.
+
+State files must not end in `.json` when they live in the auth directory: CLIProxyAPI loads every `*.json` file there as a credential, so it would appear as an extra "unknown" account. Earlier versions used `api-key-usage.json` and `usage-analytics.json`; they are renamed to the `.state` names automatically on startup.
 
 ## Inspecting usage
 
@@ -102,7 +104,7 @@ Counters are written to `state-file` (default `<auth-dir>/api-key-usage.json`) a
 
 ## Analytics and API cost
 
-Every usage record is also aggregated per month (UTC), client key, upstream credential (`auth_index`) and model into `<auth-dir>/usage-analytics.json` (key digests only, 13 months kept, flushed every 15 seconds). For Anthropic models the record is priced at Anthropic API list prices: uncached input, cache reads and cache writes (5-minute rate, since the TTL is not reported) and output, including the Claude Haiku 5.5 long-prompt tier and the 2× fast-mode rate. Other models are counted in tokens only.
+Every usage record is also aggregated per month (UTC), client key, upstream credential (`auth_index`) and model into `<auth-dir>/usage-analytics.state` (key digests only, 13 months kept, flushed every 15 seconds). For Anthropic models the record is priced at Anthropic API list prices: uncached input, cache reads and cache writes (5-minute rate, since the TTL is not reported) and output, including the Claude Haiku 5.5 long-prompt tier and the 2× fast-mode rate. Other models are counted in tokens only.
 
 `GET /v8/management/observability/usage/analytics?month=YYYY-MM` returns the rows, key labels, and the price table with its source.
 

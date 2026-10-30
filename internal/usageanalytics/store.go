@@ -24,7 +24,10 @@ import (
 
 const (
 	// DefaultStateFileName is the analytics file name inside the auth directory.
-	DefaultStateFileName = "usage-analytics.json"
+	// It must not end in .json: every *.json file there is loaded as a credential.
+	DefaultStateFileName = "usage-analytics.state"
+	// legacyStateFileName is the previous default name; it is renamed on startup.
+	legacyStateFileName = "usage-analytics.json"
 	// retainedMonths bounds the state file size.
 	retainedMonths = 13
 	flushInterval  = 15 * time.Second
@@ -156,7 +159,9 @@ func resolveStatePath(cfg *config.Config) string {
 	if errResolve != nil || strings.TrimSpace(authDir) == "" {
 		authDir = "."
 	}
-	return filepath.Join(authDir, DefaultStateFileName)
+	path := filepath.Join(authDir, DefaultStateFileName)
+	util.MigrateStateFile(filepath.Join(authDir, legacyStateFileName), path)
+	return path
 }
 
 func (s *Store) flushLoop() {

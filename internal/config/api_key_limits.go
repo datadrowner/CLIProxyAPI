@@ -6,7 +6,8 @@ import "strings"
 // Keys listed here are accepted for client authentication in addition to access.api-keys.
 type APIKeyLimitsConfig struct {
 	// StateFile stores the consumed token counters so budgets survive restarts.
-	// Empty uses "api-key-usage.json" inside the auth directory.
+	// Empty uses "api-key-usage.state" inside the auth directory. Do not use a
+	// *.json name inside the auth directory: those files are loaded as credentials.
 	StateFile string `yaml:"state-file,omitempty" json:"state-file,omitempty"`
 
 	// Subscriptions defines named plans that keys can reference.

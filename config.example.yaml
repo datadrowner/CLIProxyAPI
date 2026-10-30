@@ -130,7 +130,8 @@ access:
   # each request, so the request that crosses the limit may overshoot it.
   # Clients can check their own budget with GET /v1/api-key/usage.
   # api-key-limits:
-  #   # Where consumed token counters are persisted (default: <auth-dir>/api-key-usage.json).
+  #   # Where consumed token counters are persisted (default: <auth-dir>/api-key-usage.state).
+  #   # Do not use a *.json name inside the auth directory; those files are loaded as credentials.
   #   state-file: ""
   #   # Named plans that keys can reference. period: total (never resets, default),
   #   # daily, weekly, monthly (calendar periods in UTC), or a duration such as "5h".
